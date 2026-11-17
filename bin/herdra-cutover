@@ -13,11 +13,12 @@
  * A cutover to X:
  *   1. reads every quota fresh (`agent/scripts/limits --json`, /limits' own fetchers) and
  *      refuses when a provider X needs is at or past 90% or unread (--force overrides);
- *   2. prints what will change, then (without --plan) applies it: writes modelSets for
- *      the roles X fills, and queues one typed model request (requestModel) to each
- *      long-lived Pi on THIS machine whose role X fills: Herdra (herdra row), Cephs and
- *      manus (orchestrator row). They switch at their next idle boundary and confirm in
- *      the caller's inbox. Running Workers, helpers and reviewers finish on their model;
+ *   2. prints what will change, then (without --plan) applies it: opens one grouped
+ *      cutover receipt (openCutover) whose planned targets are exactly the asks, writes
+ *      modelSets for the roles X fills, and queues one typed model request (requestModel)
+ *      per target to each long-lived Pi on THIS machine whose role X fills: Herdra (herdra
+ *      row), Cephs and manus (orchestrator row). They switch at their next idle boundary
+ *      and answer with typed acknowledgements, which the caller's one card updates in place. Running Workers, helpers and reviewers finish on their model;
  *      other machines are never touched.
  *
  * watch: a reading at or past 80% of any provider-wide window (5h, Day, Week, Month) of a provider a role in force uses is a
@@ -37,7 +38,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi/agent");
-const { livePis, requestModel } = await import(join(agentDir, "scripts/live-pis.ts"));
+const { livePis, openCutover, recordCutoverSendFailure, requestModel } = await import(join(agentDir, "scripts/live-pis.ts"));
 type LivePi = Awaited<ReturnType<typeof livePis>>["pis"][number];
 
 const settingsPath = join(agentDir, "settings.json");
@@ -175,15 +176,24 @@ async function plan(target: string, roles: Role[], sets: Record<string, ModelSet
 }
 
 async function apply(p: Plan): Promise<{ lines: string[]; failed: number }> {
+  const targets = p.asks.map(({ pi, entry }) => ({ core: pi.core, terminal: pi.terminal, label: pi.label, requested: { model: entry.model, thinking: entry.thinking, fast: entry.fast === true } }));
+  let operation: Awaited<ReturnType<typeof openCutover>>;
+  try { operation = await openCutover(targets, { completion: "silent" }); } // preflighted before any settings write; no asks is map-only
+  catch (error) { return fail(`nothing changed: ${error instanceof Error ? error.message : error}`); }
   writeInForce(p.after);
   const lines = [`${settingsPath}: modelSets ${JSON.stringify(p.after)}`];
+  if (!operation) return { lines, failed: 0 };
+  lines.push(`cutover ${operation.id}: ${operation.targets.length} planned target(s)`);
   let failed = 0;
-  for (const { pi, entry } of p.asks) {
+  for (const [index, { pi }] of p.asks.entries()) {
+    const target = operation.targets[index]!;
     try {
-      const sent = await requestModel(pi.address, { model: entry.model, thinking: entry.thinking, fast: entry.fast === true });
+      const sent = await requestModel(pi.address, target.requested, operation);
       lines.push(`${pi.label} (${pi.address}): asked, message ${sent.id}`);
     } catch (error) {
-      lines.push(`${pi.label} (${pi.address}): FAILED, ${error instanceof Error ? error.message : error}`);
+      const reason = error instanceof Error ? error.message : String(error);
+      await recordCutoverSendFailure(operation, target, reason);
+      lines.push(`${pi.label} (${pi.address}): FAILED, ${reason}`);
       failed++;
     }
   }

@@ -27,8 +27,8 @@ Algorant is using, and know that `herdr-app shot` returns a stale frame while th
   first with their rounds and comments, a picker for the other sessions, and a local
   archive (task-114, replacing task-50's feed) in a floating right-hand window
   (task-46-14). Its `layout/apply.py` builds the
-  `main-sideshow` layout, whose tab row holds the Herdra, Usage (the
-  [usage](usage/RECIPE.md) mod) and Sideshow buttons.
+  `main-sideshow` layout, whose tab row holds the Herdra, Sideshow and
+  Usage (the [usage](usage/RECIPE.md) mod) buttons.
 - [herdra](herdra/RECIPE.md): the Herdra button and window, opening at once on
   work in flight, what needs Algorant and recent results (task-46-5, task-51).
 - [alerts](alerts/RECIPE.md): Herdr's own agent alerts (needs you, finished) forwarded to Hokum, the

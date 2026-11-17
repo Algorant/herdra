@@ -8,15 +8,15 @@ A card floating over the right side of the terminals, sitting on the pane cards'
 - its top edge on the cards' top (tab bar height + the work area's padding, 42 + 8);
 - its bottom on the cards' bottom (above the status bar, 28 + 8);
 - its right edge 8px in from the window edge, like the cards;
-- 45% of the window wide (but leaving at least 240px of terminal).
+- 90% of the pane's work area wide, up to 960px, centred, and 90% of its height (960 × 908 on Algorant's desktop).
 
-These come from the shown layout (`layout()`: `tabs`, `status` and `sidebar` sizes, the `work-body` padding), so a hidden status bar or another tab-bar height still lines up. The card looks like the shipped Files panel and the pane cards: `frame: "none"` (no Herdr dialog frame or shadow), theme `background`, 1px `border`, radius 10. A drag moves it, and Herdr remembers that spot (`key: "sideshow"`). It reopens after a restart (`keep: true`). Theme colors throughout, 13px UI text.
+These come from the shown layout (`layout()`: `tabs`, `status` and `sidebar` sizes, the `work-body` padding), so a hidden status bar or another tab-bar height still lines up. The card looks like the shipped Files panel and the pane cards: `frame: "none"` (no Herdr dialog frame or shadow), theme `background`, 1px `border`, radius 10. A drag moves it, and Herdr remembers that spot (`key: "sideshow-work"`). It reopens after a restart (`keep: true`). Its **⤢ Pair** half is a second, separately remembered key (`sideshow-pair`, task-161). Theme colors throughout, 13px UI text.
 
 1. **Header**, 42px, 1px `border` underneath:
    - a 7px status dot: `accent` with a session, `dim` without;
    - "Sideshow" in 11px `dim`;
    - the **session button**: the project chip, the session's title in 12.5px medium, truncated, and a `▾`; a `selected` fill while the picker is open. A click opens it;
-   - right-aligned 11.5px text actions in `muted` that turn `foreground` on a `hover` fill: **Browser ↗** (the session's page, opened at its newest post), **Archive**, **✕**.
+   - right-aligned 11.5px text actions in `muted` that turn `foreground` on a `hover` fill: **Browser ↗** (the session's page, opened at its newest post), **Archive**, **⤢ Pair** (or **⤢ Solo** while paired, below), **✕**.
 2. **Bar**, 34px on `chrome`, 1px `border` underneath: on the left `dim` 11.5px numbers — "3 posts · 2 updated · 2 rounds · 2 comments"; on the right a `done` dot and "live", or **Newest ↑** in `accent` (with "held" beside it) when the window stopped following.
 3. **Thread**, the rest, scrolling, padding 14, 14px between posts. Newest post first, then older ones down to the first; the first line says where the view stands, at the top: "following the newest" (`dim`), or "opened at a post · 4 newer posts" with **Back to newest** in `accent` when the window was opened from a post's link.
    - A post opens with the project chip, an "updated" tag for a post with rounds, then its title in 16px semibold, then 11px `dim`: "<age> · v<round> · <n> parts", plus " · <k> in the browser" when there are html or mermaid parts.
@@ -65,9 +65,10 @@ These come from the shown layout (`layout()`: `tabs`, `status` and `sidebar` siz
 - **Browser.** "Open ↗", "Diagram ↗" and **Browser ↗** use `cx.open_url` (the system browser) for `/p/<post>` and `/session/<id>`. **Browser ↗** opens the shown session at its newest post, `/session/<id>/p/<newest post>`, so a long thread lands at the end instead of at the top; a session with no posts opens `/session/<id>` (task-138). The terminal's own links are the app's to hand to the browser, so a link in a reply still leaves Herdr; **Post ↗** in the Herdra window is what stays in.
 - **Toggle.**
   - `ctrl-shift-s` runs `mod.open:sideshow`. `mod.json` makes that a 2×2 px, frameless popup of the same mod.
-  - With `props().overlay` set and no `props().window`, the copy reads shared `"sideshow.window"`. If it holds an id, it closes that window; otherwise it opens `{mod:"sideshow", props:{window:true}, kind:"window", frame:"none", key:"sideshow", keep:true, width, height, at}`, all in px from `window.viewport_size()` and the layout. Then it closes itself.
+  - With `props().overlay` set and no `props().window`, the copy reads shared `"sideshow.window"`. If it holds an id, it closes that window; otherwise it opens `{mod:"sideshow", props:{window:true}, kind:"window", frame:"none", key:"sideshow-work", keep:true, width, height, at}`, all in px from `window.viewport_size()` and the layout. Then it closes itself.
   - The window writes its overlay id to `"sideshow.window"` on every poll and clears it in `close()`.
 - No sounds, toasts or redraw timers; the one 5 s timer only notifies when something changed. Nothing runs while the window is closed.
+- **Pair and solo (task-161).** Herdra's **Post ↗** / **Open ↗** keeps Herdra at the pair's left half and opens this window at the right on that post (another post replaces this copy in place); **⤢ Pair** does the same from solo, opening Herdra on the left. For pairing this window asks `shared("herdra.window")` for Herdra's overlay id, closes it and opens it at the left half, key `herdra-pair`, props `{window: true, pair: "left"}`. While paired the header reads **⤢ Solo**: that closes Herdra and reopens this window at its own solo spot (`key: "sideshow-work"`), at the post it is showing (`/p/<post>`, else `/session/<id>`) so pairing and unpairing do not move the reader. Both halves are computed once at pair time as if the Spaces sidebar is open — 860 × 1009 each at (277, 50) and (1145, 50) on Algorant's desktop, 8px apart, right-aligned, full pane height — so toggling the sidebar never covers either one, and each half keeps its own remembered spot (`sideshow-pair`) apart from solo. No setting, key, timer or state file: the mode is the open window's own `props().pair`. The app cannot move an open window, so every Pair/Solo click closes and reopens what it moves; the window refetches (a frame or two). `placeFit` judges the pair half's remembered place against the pair key too.
 
 ## Built from
 
@@ -116,9 +117,10 @@ These come from the shown layout (`layout()`: `tabs`, `status` and `sidebar` siz
 ## Done when
 
 - `herdr-app check ~/.config/herdr-app/mods/sideshow` passes.
-- `ctrl-shift-s` opens the window on the right: all four borders visible, the top on the pane cards' top line, the bottom on their bottom line above the status bar, the right edge 8px in, at 45% of the window's width. Pressing it again closes it, and the next open is at the spot it was dragged to. It's back after an app restart if it was open.
+- `ctrl-shift-s` opens the window on the right: all four borders visible, the top on the pane cards' top line, the bottom on their bottom line above the status bar, the right edge 8px in, 90% of the work area wide up to 960px. Pressing it again closes it, and the next open is at the spot it was dragged to. It's back after an app restart if it was open.
 - The window shows the most recently active session's thread, newest post first, with the bar's counts and "live".
-- A Herdra row's **Post ↗** opens the window on that post's session, that post at the top of the thread, "opened at a post · N newer posts" above it and **Back to newest** giving the whole thread; an **Open ↗** on a session's address opens that session.
+- A Herdra row's **Post ↗** opens the window on that post's session beside Herdra, that post at the top of the thread, "opened at a post · N newer posts" above it and **Back to newest** giving the whole thread; an **Open ↗** on a session's address opens that session. Both sit at the pair's halves with the Spaces sidebar closed as well as open.
+- **⤢ Pair** on either window puts both side by side; **⤢ Solo** on either leaves that one alone at its own spot; **✕** on one leaves the other where it is, showing **⤢ Solo**.
 - A post published in that session appears at the top within about 5 seconds without reopening; a comment appears under its post; editing a post shows "updated" and a new round chip.
 - Clicking v2 of a post shows that round with "v2 of 3", its title, and **Back to latest**; clicking **Back to latest** returns to the newest.
 - The session button lists the sessions newest activity first, with project chips, counts and ages, a dot on one that changed; a click switches the thread, and **Browser ↗** opens the shown session at its newest post.

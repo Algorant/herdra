@@ -6,8 +6,8 @@ Usage: apply.py [~/.config/herdr-app]
 Reads <home>/layouts/main.json (Herdr rewrites it on every start, so it is always
 the shipped one) and writes <home>/layouts/main-sideshow.json with one change:
 the tab bar block (`tabs`) sits in a row with small button blocks after it:
-`herdra-button` (the Herdra attention window, task-46-5), `usage-button` (Herdra's own
-Usage popup, herdr-app/usage; only once <home>/mods/usage exists) and `sideshow-button`. Each
+`herdra-button` (the Herdra attention window, task-46-5), `sideshow-button` and `usage-button`
+(Herdra's own Usage popup, herdr-app/usage; only once <home>/mods/usage exists). Each
 button toggles its floating window; nothing resizes the terminals. With <home>/mods/alerts installed
 (herdr-app/alerts, task-59) the row also ends in a 0px `alerts` block: it draws nothing and only
 watches agents to forward Herdr's alerts to Hokum. Everything else, including the shipped tabs, files, changes, sidebar
@@ -22,7 +22,7 @@ import sys
 
 # The tab row's buttons, left to right: (block id, mod, width px). Usage is Herdra's own
 # mod (herdr-app/usage) and joins only once it is installed (a layout naming a missing mod fails).
-BUTTONS = [("herdra-button", "herdra", 100), ("usage-button", "usage", 80), ("sideshow-button", "sideshow", 104)]
+BUTTONS = [("herdra-button", "herdra", 100), ("sideshow-button", "sideshow", 104), ("usage-button", "usage", 80)]
 # The 0px listener block (herdr-app/alerts), last in the tab row; joins only once its mod is installed.
 LISTENER = ("alerts-listener", "alerts")
 HERE = os.path.dirname(os.path.abspath(__file__))

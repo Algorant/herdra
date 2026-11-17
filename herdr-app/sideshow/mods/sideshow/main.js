@@ -19,7 +19,11 @@ async function installIcon() {
 import * as fs from "fs/promises";
 
 // Keep this geometry local to the mod: Herdr resolves imports only inside the mod folder.
-function readerWindow(tree, viewport, zoom, maxWidth) {
+// `half` is "left" or "right" for the review pair (task-161): that half of the work area, the pane's
+// whole height, always computed with the Spaces sidebar's width even when it is hidden, so opening or
+// closing the sidebar never covers either half. No `half` is the solo reader: 90% of the work area,
+// capped at maxWidth, centred.
+function readerWindow(tree, viewport, zoom, maxWidth, half) {
   const find = (node, id) => {
     if (!node || typeof node !== "object") return null;
     if (node.id === id) return node;
@@ -41,23 +45,18 @@ function readerWindow(tree, viewport, zoom, maxWidth) {
   const scale = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
   const widthPx = viewport.width / scale;
   const heightPx = viewport.height / scale;
-  const left = sidebar && !sidebar.hidden ? px(sidebar) + padX : padX;
+  const left = sidebar && (!sidebar.hidden || half) ? px(sidebar) + padX : padX;
   const right = widthPx - padX;
   const top = px(tabs) + padY;
   const bottom = heightPx - px(status) - padY;
   const areaWidth = Math.max(0, right - left);
   const areaHeight = Math.max(0, bottom - top);
-  const width = Math.round(Math.min(areaWidth * 0.9, maxWidth));
-  const height = Math.round(areaHeight * 0.9);
+  const width = half ? Math.round(Math.max(0, (areaWidth - PAIR_GAP) / 2)) : Math.round(Math.min(areaWidth * 0.9, maxWidth));
+  const height = half ? Math.round(areaHeight) : Math.round(areaHeight * 0.9);
+  const x = half === "right" ? right - width : half ? left : left + (areaWidth - width) / 2;
+  const y = half ? top : top + (areaHeight - height) / 2;
   // The overlay parser zooms width/height, but render_window consumes at as pixels directly.
-  return {
-    width,
-    height,
-    at: {
-      x: Math.round((left + (areaWidth - width) / 2) * scale),
-      y: Math.round((top + (areaHeight - height) / 2) * scale),
-    },
-  };
+  return { width, height, at: { x: Math.round(x * scale), y: Math.round(y * scale) } };
 }
 
 // The app remembers where a window was in windows.json, per shown layout: `places[key]` is the spot
@@ -92,7 +91,10 @@ function insideWindow(place, viewport) {
 // the window reopen for ever.
 let replaced = null;
 
-const KEY = "sideshow-work";                     // the window's overlay key: windows.json remembers its place
+const KEY = "sideshow-work";                     // the solo window's overlay key: windows.json remembers its place
+const PAIR_KEY = "sideshow-pair";                // the pair's right half (task-161), remembered apart from solo
+const PAIR_GAP = 8;                              // between the pair's two halves, as the pane cards' gap
+const OTHER = "herdra.window";                   // shared: the Herdra window's overlay id, paired or not
 const DEFAULT_ORIGIN = "http://localhost:8228";  // the Sideshow server, unless the origin file names another
 const ORIGIN_FILE = "data/sideshow/origin";      // under the app home: one line, e.g. http://workstation.<tailnet>.ts.net:8228
 const ARCHIVE_FILE = "data/sideshow/archived";   // under the app home: one archived session id per line
@@ -110,12 +112,15 @@ const ROUNDS = 20;                               // Sideshow keeps this many ver
 const PICKER_ROWS = 12;                          // sessions in the picker before "show all"
 const ROUND_CHIPS = 6;                           // version chips before the first one folds to "…"
 
+// The spot a window opens at: the solo reader, or one half of the pair.
+const spot = (half) => readerWindow(layout(), window.viewport_size(), Number(settings().zoom ?? 1), MAX_WIDTH, half);
+
 // ctrl-shift-s and the tab-bar button (main-sideshow): close the window if it's open; else open it.
 // Open synchronously: a window opened from an async task after an await never shows.
 function toggle(done) {
   const open = shared("sideshow.window");
   if (open) { closeOverlay(open); setShared("sideshow.window", null); done?.(); return; }
-  const fit = readerWindow(layout(), window.viewport_size(), Number(settings().zoom ?? 1), MAX_WIDTH);
+  const fit = spot(null);
   openOverlay({ mod: "sideshow", props: { window: true }, kind: "window", frame: "none", key: KEY, keep: true, ...fit });
   done?.();
 }
@@ -498,11 +503,12 @@ export default class Sideshow extends View {
     const id = props()?.overlay;
     if (!id) return;
     const viewport = window.viewport_size();
-    const fit = readerWindow(layout(), viewport, Number(settings().zoom ?? 1), MAX_WIDTH);
+    const key = props()?.pair ? PAIR_KEY : KEY;          // the pair half keeps its own remembered spot
+    const fit = readerWindow(layout(), viewport, Number(settings().zoom ?? 1), MAX_WIDTH, props()?.pair ? "right" : null);
     cx.spawn(async (cx) => {
       let file = null;
       try { file = JSON.parse((await readTextFile(`${appHome()}/windows.json`)) ?? "null"); } catch (e) { return; }
-      const place = rememberedPlace(file, KEY, String(shared("layout") ?? ""), fit);
+      const place = rememberedPlace(file, key, String(shared("layout") ?? ""), fit);
       if (!place || insideWindow(place, viewport)) return;   // nothing remembered, or it fits: leave it
       // A dragged spot is always where the app put this window; a kept spec is, unless the app opened
       // the fit this mod asked for (the same size).
@@ -511,8 +517,28 @@ export default class Sideshow extends View {
       if (replaced === stamp) return;   // this run already moved the window off that place
       replaced = stamp;
       closeOverlay(id);
-      openOverlay({ mod: "sideshow", props: { window: true }, kind: "window", frame: "none", key: KEY, keep: true, ...fit });
+      openOverlay({ mod: "sideshow", props: { window: true, url: props()?.url, pair: props()?.pair }, kind: "window", frame: "none", key, keep: true, ...fit });
     });
+  }
+
+  // The address that reopens this window where it is now: the post it is anchored at, else its session.
+  here() {
+    return this.at ? `/p/${this.at}` : this.shown ? `/session/${this.shown}` : undefined;
+  }
+
+  // ⤢ Pair / ⤢ Solo (task-161). Pairing opens Herdra at the pair's left half and reopens this window at
+  // the right, both computed with the Spaces sidebar; solo closes Herdra and reopens this one at its own
+  // remembered solo spot. The app cannot move an open window, so each side is closed and reopened.
+  pairToggle() {
+    const other = shared(OTHER), me = props().overlay;
+    if (other) closeOverlay(other);
+    closeOverlay(me);
+    if (props()?.pair) {
+      openOverlay({ mod: "sideshow", props: { window: true, url: this.here() }, kind: "window", frame: "none", key: KEY, keep: true, ...spot(null) });
+      return;
+    }
+    openOverlay({ mod: "herdra", props: { window: true, openAt: Date.now(), pair: "left" }, kind: "window", frame: "none", key: "herdra-pair", keep: true, ...spot("left") });
+    openOverlay({ mod: "sideshow", props: { window: true, url: this.here(), pair: "right" }, kind: "window", frame: "none", key: PAIR_KEY, keep: true, ...spot("right") });
   }
 
   // Read the origin and the archive file once, then poll the session list.
@@ -1098,6 +1124,7 @@ export default class Sideshow extends View {
       .when(this.held, (el) => el.child(this.action("ss-newest", "Newest ↑", (_e, cx) => this.follow(cx), true)))
       .when(Boolean(this.origin && s), (el) => el.child(this.action("ss-browser", "Browser ↗", (_e, cx) => this.openInBrowser(cx, this.browserPath()))))
       .when(Boolean(s), (el) => el.child(this.action("ss-archive", "Archive", (_e, cx) => this.archive(cx))))
+      .child(this.action("ss-pair", props()?.pair ? "⤢ Solo" : "⤢ Pair", () => this.pairToggle()))
       .child(this.action("ss-close", "✕", () => closeOverlay(props().overlay)));
   }
 
