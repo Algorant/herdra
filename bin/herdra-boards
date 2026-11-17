@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Every project's board, as JSON: [{project, cwd, address, name, machine, ceph}], one per project.
+# A board is the cwd of a live terminal in a space's `main` tab, on every machine hc reaches; the project
+# is the space's name. Prefer the space whose main tab runs its Ceph (an agent with no parent: `ceph`
+# true), then this machine's (`machine` null). A cwd with no Tandem workspace is the reader's to skip.
+# Read by herdra-online (needs-<host> Tasks) and herdra-check (papercuts, linked Tasks).
+set -euo pipefail
+
+hc ls --json | jq -c '
+  [.terminals[] | select(.state == "live" and (.cwd // "") != "" and ((.where // "") | test(" / main$")))
+   | {project: (.where | split(" / ")[0]), cwd, address, name,
+      machine: (if (.address | contains("/")) then (.address | split("/")[0]) else null end),
+      ceph: (.agent != null and .parent == null and (.agent as $a | ["zsh", "bash", "fish", "sh", "nu", "pwsh"] | index($a) | not))}]
+  | group_by(.project | ascii_downcase) | map(sort_by([(.ceph | not), (.machine != null)]) | .[0])'

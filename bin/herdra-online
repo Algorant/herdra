@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Machine-gated work (task-94, option B picked by Algorant 2026-11-07). Work that must run on another
+# machine is a Task on its owner's own Tandem board tagged `needs-<host>` (an `hc machine ls` name);
+# that tag is the only record. When hc core reconnects to <host>, the Herdra window on workstation runs
+# `herdra-online <host>` once (through `hc run`, so it has a terminal to send from). Each owning Ceph
+# gets one inbox result listing its tagged Tasks; tagged Tasks on a board whose Ceph isn't running go
+# to Herdra. The owner runs them on the host and removes the tag (or completes the Task); anything
+# still tagged is sent again on the next reconnect.
+#
+# It also brings the machine's herdra checkout up to this machine's main before anything is asked of
+# it, since the Herdr app there loads its mods from that checkout (task-133). A machine that is
+# connected runs the same sync right after each merge, through .config/wt.toml's post-merge hook.
+#
+#   herdra-online <host>                  tell the owners (needs an hc terminal, HC_TERMINAL_ID);
+#                                         refused unless hc shows <host> connected. Logged to
+#                                         $XDG_STATE_HOME/herdra/online.log
+#   herdra-online --list [--json] [host]  the tagged Tasks, for <host> or every machine in
+#                                         `hc machine ls`; sends nothing. herdra-open footer's Pending,
+#                                         the Herdra window's Pending and Herdra's session start read it
+#
+# Boards: the cwd of each live terminal in a space's `main` tab, on every machine hc reaches, one per
+# project (the space's name). Its owner is that terminal when it is an agent with no parent (the
+# Ceph), else herdra. A cwd with no Tandem workspace is skipped.
+set -euo pipefail
+
+fail() { echo "herdra-online: $*" >&2; exit 1; }
+
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+
+list= json= host=
+while (($#)); do
+  case "$1" in
+    --list) list=1 ;;
+    --json) json=1 ;;
+    -*) fail "unknown option $1" ;;
+    *) [[ -z $host ]] || fail "one host at a time, got $host and $1"; host="$1" ;;
+  esac
+  shift
+done
+[[ -n $list || -n $host ]] || fail 'usage: herdra-online <host> | herdra-online --list [--json] [host]'
+[[ -z $json || -n $list ]] || fail '--json goes with --list'
+
+machines=$(hc machine ls --json)
+if [[ -n $host ]]; then
+  host=$(jq -r --arg h "$host" 'first(.machines[] | select((.name | ascii_downcase) == ($h | ascii_downcase)) | .name) // empty' <<<"$machines")
+  [[ -n $host ]] || fail "no machine $host in hc machine ls"
+  hosts=("$host")
+else
+  mapfile -t hosts < <(jq -r '.machines[].name' <<<"$machines")
+fi
+
+if [[ -z $list ]]; then
+  # Telling the owners: only while hc is connected to the host, from an hc terminal; everything it
+  # prints, board errors included, is logged.
+  jq -e --arg h "$host" '.machines | any(.name == $h and .state == "connected")' <<<"$machines" >/dev/null \
+    || fail "hc is not connected to $host"
+  [[ -n ${HC_TERMINAL_ID:-} ]] || fail "telling the owners needs an hc terminal (run it with hc run)"
+  log="${XDG_STATE_HOME:-$HOME/.local/state}/herdra/online.log"
+  mkdir -p "$(dirname "$log")"
+  exec > >(tee -a "$log") 2>&1
+  echo "$(date -u +%FT%TZ) $host connected"
+  # Its herdra checkout first: the Herdr app there loads its mods from it, so it is stale until this
+  # runs. A failure is logged and the machines below still get their Tasks (task-133).
+  errors=0
+  "$here/herdra-mods-sync" "$host" || errors=1
+fi
+
+# One board per project: prefer the space whose main tab runs its Ceph, then this machine's.
+boards=$("$here/herdra-boards")
+
+# This machine's tandem itself, not its mise shim: in a project with an untrusted mise.toml the shim
+# fails before tandem runs (seen in mediafetch under hc run).
+tandem=$(cd / && mise which tandem)
+rows='[]' errors=${errors:-0}
+# Every board and host read at once (a `tandem list` that syncs its board can take seconds).
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+n=$(jq length <<<"$boards")
+for ((i = 0; i < n; i++)); do
+  cwd=$(jq -r ".[$i].cwd" <<<"$boards") m=$(jq -r ".[$i].machine // empty" <<<"$boards")
+  for h in "${hosts[@]}"; do
+    if [[ -n $m ]]; then
+      hc exec --on "$m" --cwd "$cwd" tandem list --json --tag "needs-$h" >"$tmp/$i-$h" 2>"$tmp/$i-$h.err" &
+    else
+      (cd "$cwd" && "$tandem" list --json --tag "needs-$h") >"$tmp/$i-$h" 2>"$tmp/$i-$h.err" &
+    fi
+  done
+done
+wait
+
+for ((i = 0; i < n; i++)); do
+  b=$(jq -c ".[$i]" <<<"$boards") cwd=$(jq -r ".[$i].cwd" <<<"$boards") m=$(jq -r ".[$i].machine // empty" <<<"$boards")
+  for h in "${hosts[@]}"; do
+    out=$(<"$tmp/$i-$h")
+    if ! jq -e '.ok == true' <<<"$out" >/dev/null 2>&1; then
+      grep -q 'No Tandem workspace found' <<<"$out" && break
+      echo "herdra-online: cannot read the $(jq -r .project <<<"$b") board (${m:+$m:}$cwd): $(cat "$tmp/$i-$h.err" - <<<"$out" | tr '\n' ' ' | cut -c1-400)" >&2
+      errors=1; break
+    fi
+    rows=$(jq -c --argjson b "$b" --argjson out "$out" --arg h "$h" \
+      '. + [$out.data[] | {host: $h, project: $b.project, id, title, owner: (if $b.ceph then ($b.name // $b.address) else "herdra" end), ceph: $b.ceph}]' <<<"$rows")
+  done
+done
+
+if [[ -n $list ]]; then
+  if [[ -n $json ]]; then
+    jq --argjson ms "$machines" '[.[] | . as $r | . + {connected: ($ms.machines | any(.name == $r.host and .state == "connected"))}]' <<<"$rows"
+  else
+    jq -r '.[] | "\(.host)  \(.project) \(.id)  \(.title)  · tell: \(.owner)"' <<<"$rows"
+  fi
+  exit "$errors"
+fi
+
+echo "$(jq length <<<"$rows") Task(s) tagged needs-$host"
+
+while IFS= read -r g; do
+  owner=$(jq -r '.[0].owner' <<<"$g")
+  ids=$(jq -r '[group_by(.project)[] | "\(.[0].project) \([.[].id] | join(", "))"] | join("; ")' <<<"$g")
+  headline="$host is online: run $ids"
+  ((${#headline} <= 160)) || headline="$host is online: run $(jq length <<<"$g") Tasks tagged needs-$host"
+  body="$headline
+
+$(jq -r --arg h "$host" 'group_by(.project)[] | "Tagged needs-\($h) on the \(.[0].project) board\(if .[0].ceph then "" else " (no running Ceph)" end):\n" + ([.[] | "- \(.id) \(.title)"] | join("\n")) + "\n"' <<<"$g")
+
+Run them on $host now (hc exec or hc run --on $host, or a Worker there), and remove the needs-$host tag or complete each Task when it is done. Anything still tagged is sent again when $host next reconnects.
+(bin/herdra-online, task-94)"
+  if id=$("$HOME/.pi/agent/scripts/inbox" result "$owner" "$body"); then
+    echo "sent $id to $owner: $ids"
+  else
+    echo "NOT sent to $owner: $ids"; errors=1
+  fi
+done < <(jq -c 'group_by(.owner)[]' <<<"$rows")
+exit "$errors"

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Revive the Herdr fleet after a reboot (task-122). After a restart every hc terminal sits at a bare
+# shell; labels survive in the hc core. This resumes what was running, once, with no timers:
+#   - a terminal at a shell with a `pi.session` label (published by pi-herdr) whose file exists
+#       -> `pi --session <file>`
+#   - a `<space> / tandem` terminal at a shell -> `tandem tui`
+#   - Sideshow, as hc job `sideshow`, when :8228 does not answer
+# Idempotent: a terminal whose foreground is not a shell is skipped, so a second run changes nothing.
+#
+#   herdra-revive [--dry-run]    --dry-run prints what it would do and sends nothing
+set -euo pipefail
+
+dry=0
+case "${1:-}" in
+  "") ;;
+  --dry-run) dry=1 ;;
+  *) echo "usage: herdra-revive [--dry-run]" >&2; exit 2 ;;
+esac
+
+done_n=0
+skipped=()
+
+act() { # act <description> <command...>
+  local what=$1; shift
+  if ((dry)); then echo "would: $what"; else "$@" >/dev/null; echo "did: $what"; fi
+  done_n=$((done_n + 1))
+}
+
+while IFS= read -r t; do
+  info=$(hc get "$t" --json)
+  # At a shell prompt = the foreground is a bare shell (one argv word); `bash script ...` is a program.
+  fg=$(jq -r '.foreground | if (.argv | length) == 1 then .name else "\(.name // "nothing") (argv: \(.argv | join(" ") | .[0:40]))" end' <<<"$info")
+  where=$(jq -r '.labels.where // ""' <<<"$info")
+  session=$(jq -r '.labels["pi.session"] // ""' <<<"$info")
+  case "$fg" in
+    zsh | bash | sh) ;;
+    *) skipped+=("$t: running ${fg:-nothing}"); continue ;;
+  esac
+  if [[ -n $session ]]; then
+    if [[ -f $session ]]; then
+      act "$t ($where): pi --session $session" hc send "$t" "pi --session $session"
+    else
+      skipped+=("$t: session file missing: $session")
+    fi
+  elif [[ $where == *" / tandem" ]]; then
+    act "$t ($where): tandem tui" hc send "$t" "tandem tui"
+  else
+    skipped+=("$t: shell with no pi.session and not a tandem tab")
+  fi
+done < <(hc ls --json | jq -r '.terminals[] | select(.state == "live") | .address')
+
+if curl --noproxy '*' --max-time 3 --silent --output /dev/null http://localhost:8228/; then
+  skipped+=("sideshow: already answering on :8228")
+else
+  act "sideshow: hc run --bg sideshow serve --port 8228" \
+    hc run --bg --no-parent --no-notify --name sideshow -- sideshow serve --port 8228
+fi
+
+echo "---"
+echo "$done_n action(s)$( ((dry)) && echo ' (dry run, nothing sent)'), ${#skipped[@]} skipped"
+for ((i = 0; i < ${#skipped[@]}; i++)); do echo "skipped $((i + 1)): ${skipped[i]}"; done

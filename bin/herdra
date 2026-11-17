@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Open Herdra: show the running Herdra (the hc terminal named `herdra`), or start
+# Pi in this repository as `herdra` in the `main` tab of the `herdra` app space.
+set -euo pipefail
+
+name=herdra
+home="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+fail() { echo "herdra: $*" >&2; exit 1; }
+app() { local out; out=$(herdr-app do "$@") || fail "herdr-app do $1: $out"; printf '%s' "$out"; }
+
+if hc get "$name" --json >/dev/null 2>&1; then
+  app agent.focus --terminal "$name" >/dev/null
+  echo "herdra: showed the running Herdra"
+  exit 0
+fi
+
+space=$(herdr-app ls | jq -r --arg n "$name" '[.spaces[] | select(.name == $n and .machine == null)]
+  | if length > 1 then error("more than one app space named \($n)") else (.[0].id // empty) end')
+[[ -n "$space" ]] || space=$(app space.new --name "$name" --folder "$home" --tab tandem --argv '["tandem","tui"]' | jq -r .space)
+
+started=$(hc run --bg --no-parent --json --name "$name" --cwd "$home" --label "herdr.space=$space" -- pi) \
+  || fail "hc run did not start Pi: $started"
+address=$(jq -r .address <<<"$started")
+tab=$(herdr-app ls | jq -r --arg t "$address" '[.spaces[].tabs[] | select(any(.terminals[]; .terminal == $t)) | .id][0] // empty')
+[[ -z "$tab" ]] || app tab.rename --id "$tab" --name main >/dev/null
+app agent.focus --terminal "$address" >/dev/null
+echo "herdra: started Herdra ($address) in space $name"

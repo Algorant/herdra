@@ -1,0 +1,322 @@
+#!/usr/bin/env bun
+/**
+ * herdra-cutover <set> [--plan] [--force]   "cutover to X": one column of the matrix, now
+ * herdra-cutover status                     who runs on what, beside every provider's quota
+ * herdra-cutover watch [--plan]             the near-limit check herdra-check runs (JSON flags)
+ *
+ * The matrix is `sets` in ~/.pi/agent/model-roles.json (owned by .pi): one named set per
+ * column (claude, openai, opencode, grok, in that order), each filling some of the roles
+ * herdra, orchestrator, worker, subagent and review. A role a set leaves out is an empty
+ * cell: no cutover target, so that role keeps its current set. This workstation's local
+ * settings name the set in force per role ("pi-agency".modelSets), which new launches read.
+ *
+ * A cutover to X:
+ *   1. reads every quota fresh (`agent/scripts/limits --json`, /limits' own fetchers) and
+ *      refuses when a provider X needs is at or past 90% or unread (--force overrides);
+ *   2. prints what will change, then (without --plan) applies it: writes modelSets for
+ *      the roles X fills, and queues one typed model request (requestModel) to each
+ *      long-lived Pi on THIS machine whose role X fills: Herdra (herdra row), Cephs and
+ *      manus (orchestrator row). They switch at their next idle boundary and confirm in
+ *      the caller's inbox. Running Workers, helpers and reviewers finish on their model;
+ *      other machines are never touched.
+ *
+ * watch: a reading at or past 80% of any provider-wide window (5h, Day, Week, Month) of a provider a role in force uses is a
+ * `quota-near` flag; at or past 90% (also when first seen already past it) every role in
+ * force on that provider is cut over to the next column that fills it and has room, then
+ * reported as `quota-switched` (or `quota-stuck` when no column has room). Readings come
+ * from `limits --json --max-age 900`: at most one fresh read per provider per 15 minutes,
+ * no timer and no state of its own. Output: herdra-check's flag objects, one JSON array.
+ * watch is report-only while the machine-local `pi-agency-temporary` settings section
+ * exists (an incident's deliberate model map): no flags, no modelSets write, no model
+ * requests. Removing that section restores automatic cutover; a manual
+ * `herdra-cutover <set>` is unaffected either way.
+ */
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { join } from "node:path";
+
+const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi/agent");
+const { livePis, requestModel } = await import(join(agentDir, "scripts/live-pis.ts"));
+type LivePi = Awaited<ReturnType<typeof livePis>>["pis"][number];
+
+const settingsPath = join(agentDir, "settings.json");
+const rolesPath = join(agentDir, "model-roles.json");
+const limitsPath = join(agentDir, "scripts/limits");
+const ROLES = ["herdra", "orchestrator", "worker", "subagent", "review"] as const;
+type Role = (typeof ROLES)[number];
+type Entry = { model: string; thinking: string; fast?: boolean };
+type ModelSet = Partial<Record<Role, Entry | Entry[]>>;
+const WARN = 80;
+const SWITCH = 90;
+const WATCH_MAX_AGE = 900;
+const PI_ROLE: Record<string, Role> = { herdra: "herdra", ceph: "orchestrator", manus: "orchestrator" };
+
+function fail(message: string): never {
+  console.error(`herdra-cutover: ${message}`);
+  process.exit(1);
+}
+const readJson = (path: string): any => {
+  try { return JSON.parse(readFileSync(path, "utf8")); } catch (error) { return fail(`cannot read ${path}: ${error instanceof Error ? error.message : error}`); }
+};
+
+// ---------- the matrix and the sets in force ----------
+
+function loadSets(): Record<string, ModelSet> {
+  const sets = readJson(rolesPath).sets;
+  if (!sets || typeof sets !== "object") fail(`${rolesPath} has no "sets" (the cutover matrix); .pi owns that file`);
+  return sets;
+}
+const entriesOf = (cell: Entry | Entry[] | undefined): Entry[] => (cell === undefined ? [] : Array.isArray(cell) ? cell : [cell]);
+const providerOf = (model: string): string => model.slice(0, model.indexOf("/"));
+const providersOf = (cell: Entry | Entry[] | undefined): string[] => [...new Set(entriesOf(cell).map((e) => providerOf(e.model)))];
+const cellText = (cell: Entry | Entry[] | undefined): string =>
+  entriesOf(cell).map((e) => `${e.model.slice(e.model.indexOf("/") + 1)} ${e.thinking}${e.fast ? " fast" : ""}`).join(", then ") || "(empty)";
+
+function writeInForce(next: Partial<Record<Role, string>>): void {
+  const settings = readJson(settingsPath);
+  const section = { ...(settings["pi-agency"] ?? {}), modelSets: next };
+  delete section.modelProviders; // modelSets replaces the provider filter on this machine
+  settings["pi-agency"] = section;
+  writeFileSync(`${settingsPath}.tmp`, `${JSON.stringify(settings, null, 2)}\n`);
+  renameSync(`${settingsPath}.tmp`, settingsPath);
+}
+
+// ---------- quotas, from limits --json ----------
+
+type Window = { label: string; usedPercent: number; resetAt: string | null };
+type Reading = { provider: string; status: string; ageSeconds: number | null; windows: Window[] };
+
+async function readQuotas(maxAge?: number): Promise<Map<string, Reading>> {
+  const proc = Bun.spawn([limitsPath, "--json", ...(maxAge ? ["--max-age", String(maxAge)] : [])], { stdout: "pipe", stderr: "pipe" });
+  const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  let parsed: { providers: Reading[] };
+  try { parsed = JSON.parse(out); } catch { return fail(`limits --json gave no reading (exit ${code}): ${err.trim().split("\n").pop() ?? ""}`); }
+  return new Map(parsed.providers.map((p) => [p.provider, p]));
+}
+
+/** Provider-wide windows only; per-model windows (Opus, Sonnet, Spark …) apply to no set, as in .pi's loader. */
+const PROVIDER_WINDOWS = new Set(["5h", "Day", "Week", "Month"]);
+
+/** The fullest current provider-wide window of a provider (reset still ahead, any reading age), or undefined. */
+function fullest(reading: Reading | undefined): Window | undefined {
+  const now = Date.now();
+  const current = (reading?.windows ?? []).filter((w) => PROVIDER_WINDOWS.has(w.label) && w.resetAt !== null && Date.parse(w.resetAt) > now);
+  return current.sort((a, b) => b.usedPercent - a.usedPercent)[0];
+}
+
+function when(iso: string | null): string {
+  if (!iso) return "no reset time";
+  const d = new Date(iso);
+  const day = d.toLocaleDateString("en-US", { weekday: "short" });
+  const time = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }).toLowerCase();
+  return d.toDateString() === new Date().toDateString() ? time : `${day} ${time}`;
+}
+
+function quotaText(provider: string, quotas: Map<string, Reading>): string {
+  const r = quotas.get(provider);
+  if (!r) return `${provider}: no reading (not configured)`;
+  const windows = r.windows.map((w) => `${w.label} ${Math.round(w.usedPercent)}% (resets ${when(w.resetAt)})`).join(", ") || "no windows";
+  const age = r.ageSeconds === null ? "" : r.ageSeconds < 60 ? ", read just now" : `, read ${Math.round(r.ageSeconds / 60)}m ago`;
+  return `${provider}: ${windows}${r.status === "error" ? ", FAILED to refresh" : ""}${age}`;
+}
+
+/** Why a cell cannot take over now, or undefined when it can: every provider it needs is read and below 90% (a review list needs one). */
+function blocked(cell: Entry | Entry[] | undefined, role: Role, quotas: Map<string, Reading>): string | undefined {
+  const problems = providersOf(cell).map((p) => {
+    const top = fullest(quotas.get(p));
+    if (!top) return `${p} has no current reading`;
+    return top.usedPercent >= SWITCH ? `${p} ${top.label} at ${Math.round(top.usedPercent)}% until ${when(top.resetAt)}` : undefined;
+  });
+  const bad = problems.filter((x): x is string => x !== undefined);
+  if (role === "review" ? bad.length === problems.length && bad.length > 0 : bad.length > 0) return bad.join("; ");
+  return undefined;
+}
+
+// ---------- one cutover: some roles to one set ----------
+
+type Plan = { set: string; roles: Role[]; before: Partial<Record<Role, string>>; after: Partial<Record<Role, string>>; asks: { pi: LivePi; entry: Entry }[]; lines: string[] };
+
+const INITIAL: Record<Role, string> = { herdra: "claude", orchestrator: "openai", worker: "claude", subagent: "claude", review: "openai" };
+// Loader code first landed here; descendants retain capability even after data-only commits.
+const SETS_LOADER_COMMIT = "79a6cb7741c819583c8c7542ec85585f691d5b77";
+function setsCapable(p: LivePi): boolean {
+  return !!p.loadedRevision && spawnSync("git", ["-C", join(agentDir, ".."), "merge-base", "--is-ancestor", SETS_LOADER_COMMIT, p.loadedRevision]).status === 0;
+}
+
+async function plan(target: string, roles: Role[], sets: Record<string, ModelSet>, current: Partial<Record<Role, string>> | undefined, inventory: Awaited<ReturnType<typeof livePis>>): Promise<Plan> {
+  const assigned = (role: Role): string => target === "init" ? INITIAL[role] : target;
+  const after = { ...(current ?? {}) };
+  const lines: string[] = [];
+  for (const role of roles) {
+    const name = assigned(role);
+    after[role] = name;
+    const was = current?.[role];
+    lines.push(target === "init" ? `${role}: current defaults → ${name} (${cellText(sets[name]![role])}); no model change` : was === name ? `${role}: already ${name} (${cellText(sets[name]![role])})` : `${role}: ${was ?? "unset"} → ${name} (${cellText(sets[name]![role])})`);
+  }
+  for (const role of ROLES.filter((r) => !roles.includes(r))) lines.push(`${role}: no ${target} cell, stays ${current?.[role] ?? "unset"}`);
+  const asks: Plan["asks"] = [];
+  for (const p of inventory.pis) {
+    if (p.machine !== inventory.localMachine) continue;
+    const where = `${p.label} (${p.address})`;
+    const role = PI_ROLE[p.role];
+    if (!role) { if (!p.shortLived) lines.push(`${where}: kept, no matrix row for ${p.role}`); continue; }
+    if (!roles.includes(role)) { lines.push(`${where}: kept on ${p.model ?? "unknown"}, empty ${target} cell for ${role}`); continue; }
+    const entry = entriesOf(sets[assigned(role)]![role])[0]!;
+    if (p.error) { lines.push(`${where}: skipped, unreachable (${p.error})`); continue; }
+    if (!p.modelCapable) { lines.push(`${where}: skipped, no model receiver (needs one /reload)`); continue; }
+    if (p.model === entry.model) { lines.push(`${where}: already on ${entry.model}`); continue; }
+    lines.push(`${where}: ${p.model ?? "unknown"} → ${entry.model} · ${entry.thinking}${entry.fast ? " · fast" : ""}`);
+    asks.push({ pi: p, entry });
+  }
+  const others = inventory.pis.filter((p) => p.machine !== inventory.localMachine).length;
+  if (others) lines.push(`${others} Pi(s) on other machines: not touched`);
+  return { set: target, roles, before: current ?? {}, after, asks, lines };
+}
+
+async function apply(p: Plan): Promise<{ lines: string[]; failed: number }> {
+  writeInForce(p.after);
+  const lines = [`${settingsPath}: modelSets ${JSON.stringify(p.after)}`];
+  let failed = 0;
+  for (const { pi, entry } of p.asks) {
+    try {
+      const sent = await requestModel(pi.address, { model: entry.model, thinking: entry.thinking, fast: entry.fast === true });
+      lines.push(`${pi.label} (${pi.address}): asked, message ${sent.id}`);
+    } catch (error) {
+      lines.push(`${pi.label} (${pi.address}): FAILED, ${error instanceof Error ? error.message : error}`);
+      failed++;
+    }
+  }
+  return { lines, failed };
+}
+
+// ---------- commands ----------
+
+const args = process.argv.slice(2);
+const command = args[0];
+const dry = args.includes("--plan");
+const force = args.includes("--force");
+const usage = "usage: herdra-cutover init [--plan] | <set> [--plan] [--force] | status | watch [--plan]";
+if (args.length === 1 && (command === "--help" || command === "-h")) {
+  console.log(usage);
+  process.exit(0);
+}
+if (!command || args.slice(1).some((a) => a !== "--plan" && a !== "--force")) fail(usage);
+
+const sets = loadSets();
+const settings = readJson(settingsPath);
+const current: Partial<Record<Role, string>> | undefined = settings["pi-agency"]?.modelSets;
+
+if (command === "status") {
+  const [quotas, inventory] = await Promise.all([readQuotas(WATCH_MAX_AGE), livePis()]);
+  console.log(`sets in force (${settingsPath}):`);
+  for (const role of ROLES) {
+    const name = current?.[role];
+    console.log(`  ${role}: ${name ? `${name} — ${cellText(sets[name]?.[role])}` : "unset"}`);
+  }
+  console.log("quotas:");
+  for (const provider of quotas.keys()) console.log(`  ${quotaText(provider, quotas)}`);
+  console.log("running Pis:");
+  for (const m of inventory.machines.filter((m: any) => m.state !== "connected")) console.log(`  machine ${m.name}: ${m.state}, not inspected`);
+  for (const p of inventory.pis) {
+    const role = PI_ROLE[p.role];
+    const want = p.machine === inventory.localMachine && role && current?.[role] ? entriesOf(sets[current[role]!]?.[role])[0]?.model : undefined;
+    const mark = want && p.model !== want ? `  (set says ${want})` : "";
+    console.log(`  ${p.label} (${p.address}) [${p.role}@${p.machine}, ${p.status}]: ${p.model ?? "unknown"}${mark}`);
+  }
+  process.exit(0);
+}
+
+if (command === "watch") {
+  if (force) fail(usage);
+  if (Object.hasOwn(settings, "pi-agency-temporary")) {
+    console.log("[]");
+    console.error(`herdra-cutover watch: ${settingsPath} has "pi-agency-temporary" (deliberate incident routing), so automatic cutover is report-only; remove that section to restore it`);
+    process.exit(0);
+  }
+  if (!current) { console.log("[]"); console.error("herdra-cutover watch: no modelSets in force yet; nothing to watch"); process.exit(0); }
+  const quotas = await readQuotas(WATCH_MAX_AGE);
+  const now = Math.floor(Date.now() / 1000);
+  const flag = (kind: string, key: string, since: number, headline: string) =>
+    ({ key: `${kind}:${key}`, kind, agent: "herdra", terminal: null, item: null, since: new Date(since * 1000).toISOString().replace(/\.\d+Z$/, "Z"), headline });
+  const inUse = new Map<string, Role[]>();
+  for (const role of ROLES) {
+    const name = current[role];
+    if (!name) continue;
+    for (const p of providersOf(sets[name]?.[role])) inUse.set(p, [...(inUse.get(p) ?? []), role]);
+  }
+  const flags: ReturnType<typeof flag>[] = [];
+  const names = Object.keys(sets);
+  const moves = new Map<string, Role[]>(); // target set -> roles
+  const movedFrom = new Map<Role, { provider: string; to: string }>();
+  for (const [provider, roles] of inUse) {
+    const reading = quotas.get(provider);
+    const top = fullest(reading);
+    const readAt = now - (reading?.ageSeconds ?? 0);
+    if (!top) { flags.push(flag("quota-unknown", provider, now, `${provider} has no current quota reading (used by ${roles.join(", ")}): check /limits`)); continue; }
+    const pct = Math.round(top.usedPercent);
+    const where = `${provider} ${top.label} ${pct}% (resets ${when(top.resetAt)})`;
+    if (top.usedPercent < WARN) continue;
+    if (top.usedPercent < SWITCH) { flags.push(flag("quota-near", provider, readAt, `${where}, used by ${roles.join(", ")}: at ${SWITCH}% Herdra moves any of them left without room to the next column`)); continue; }
+    for (const role of roles) {
+      const from = current[role]!;
+      if (!blocked(sets[from]?.[role], role, quotas)) continue; // a review list with another provider still has room
+      const start = names.indexOf(from);
+      const next = [...names.slice(start + 1), ...names.slice(0, start)].find((n) => sets[n]?.[role] && !blocked(sets[n]![role], role, quotas));
+      if (!next) { flags.push(flag("quota-stuck", `${provider}:${role}`, readAt, `${where}: ${role} has no other column with room; nothing switched`)); continue; }
+      moves.set(next, [...(moves.get(next) ?? []), role]);
+      movedFrom.set(role, { provider, to: next });
+    }
+  }
+  if (moves.size) {
+    const inventory = await livePis();
+    let state = current;
+    for (const [target, roles] of moves) {
+      const p = await plan(target, roles, sets, state, inventory);
+      const result = dry ? { lines: [], failed: 0 } : await apply(p);
+      state = p.after;
+      const asked = p.asks.map((a) => a.pi.label).join(", ") || "no running Pis";
+      const ask = dry ? "would ask" : "asked";
+      for (const role of roles) {
+        const { provider } = movedFrom.get(role)!;
+        const top = fullest(quotas.get(provider))!;
+        flags.push(flag(dry ? "quota-would-switch" : "quota-switched", `${provider}:${role}`, now,
+          `${provider} ${top.label} ${Math.round(top.usedPercent)}% (resets ${when(top.resetAt)}): ${dry ? "would switch" : "switched"} ${role} ${current[role]} → ${target}; ${ask} ${asked}${result.failed ? `; ${result.failed} request(s) FAILED` : ""}`));
+      }
+    }
+  }
+  console.log(JSON.stringify(flags));
+  process.exit(0);
+}
+
+if (command === "init" && current) fail("already initialized; use a named-set cutover instead");
+if (command !== "init" && !sets[command]) fail(`no set "${command}" in ${rolesPath} (sets: ${Object.keys(sets).join(", ")}). ${usage}`);
+const roles = command === "init" ? [...ROLES] : ROLES.filter((r) => sets[command]![r] !== undefined);
+const cell = (role: Role) => sets[command === "init" ? INITIAL[role] : command]![role];
+if (!current && roles.length !== ROLES.length) fail(`no modelSets in force yet: the first cutover must be to a set that fills every role (${Object.keys(sets).filter((n) => ROLES.every((r) => sets[n]![r])).join(", ")})`);
+
+const [quotas, inventory] = await Promise.all([readQuotas(), livePis()]);
+console.log(`cutover to ${command}${dry ? " (plan only, nothing changed)" : ""}`);
+console.log("quotas, read now:");
+for (const provider of new Set(roles.flatMap((r) => providersOf(cell(r))))) console.log(`  ${quotaText(provider, quotas)}`);
+const refusals = roles.map((r) => [r, blocked(cell(r), r, quotas)] as const).filter(([, why]) => why);
+for (const [role, why] of refusals) console.log(`  ${role} cannot move to ${command}: ${why}`);
+const p = await plan(command, roles, sets, current, inventory);
+console.log("changes:");
+for (const line of p.lines) console.log(`  ${line}`);
+for (const m of inventory.machines.filter((m: any) => m.state !== "connected")) console.log(`  machine ${m.name}: ${m.state}, not inspected`);
+// First opt-in: a Pi still running an older settings reader rejects modelSets (and with it inbox
+// addressing), so first opt-in requires the loader capability, not the newest data-only HEAD.
+const behind = current ? [] : inventory.pis.filter((p) => p.machine === inventory.localMachine && !setsCapable(p));
+if (!current) {
+  console.log(behind.length
+    ? `first opt-in: ${behind.length} Pi(s) lack proved sets-loader capability; ask .pi for a targeted typed reload: ${behind.map((p) => `${p.label} (${p.loadedRevision?.slice(0, 8) ?? "unknown"})`).join(", ")}`
+    : "first opt-in: every Pi here has the sets-loader capability");
+}
+if (dry) process.exit(refusals.length || behind.length ? 1 : 0);
+if (behind.length) fail("refused: writing modelSets now would break the Pis above (their settings reader rejects it); nothing changed");
+if (refusals.length && !force) fail(`refused: ${command} is at or past ${SWITCH}% or unread for ${refusals.map(([r]) => r).join(", ")}; nothing changed (--force to cut over anyway)`);
+const result = await apply(p);
+console.log("applied:");
+for (const line of result.lines) console.log(`  ${line}`);
+process.exit(result.failed ? 1 : 0);

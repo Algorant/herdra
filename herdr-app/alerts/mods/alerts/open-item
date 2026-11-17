@@ -1,0 +1,16 @@
+#!/bin/sh
+# Open on a Needs-you card: follow the herdra-open item's link ($1 kind, $2 target).
+#   post   the Sideshow post, in the browser
+#   task   raise Herdr and show the Herdra window (its Needs-you list holds the item)
+#   agent  raise Herdr and show that agent (herdr-jump)
+# Hokum runs this directly (omarchy-actions), without the login shell's PATH.
+PATH="$HOME/.local/bin:$PATH"
+case "$1" in
+  post) exec xdg-open "$2" ;;
+  agent) exec "$(dirname "$0")/herdr-jump" "$2" ;;
+  task)
+    hyprctl dispatch 'hl.dsp.focus({ window = "class:herdr-app" })'
+    # mod.open toggles the window, so only when it isn't open already.
+    herdr-app status | jq -e '.overlays | index("herdra")' >/dev/null || exec herdr-app do mod.open --name herdra ;;
+  *) echo "open-item: unknown link kind $1" >&2; exit 1 ;;
+esac

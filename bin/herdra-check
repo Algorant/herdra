@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Herdra's stateless supervision check: print the current flags as a JSON array
+# (and nothing else); exit 0 even when there are flags. Whoever runs it does any
+# edge detection itself; nothing is kept here.
+#
+# Each flag: {key, kind, agent, terminal, item, since, headline}. `key` is
+# "<kind>:<agent or item id>", stable across runs; `since` is when the condition
+# began (ISO 8601 UTC); `headline` is one line, outcome first.
+#
+#   blocked  hc status blocked >= 2 min
+#   silent   an idle or done Pi that owes an open item (--on) or an open inbox request to it, its status
+#            and the debt both >= 15 min old, while no child of it (for a Ceph, no Pi in its space)
+#            is working (decided by `herdra-checkin --flags`, the same code as the check-in card)
+#   gone     owes something but no live terminal matches it
+#   down     owes something but the terminal it names is a plain shell: its Pi died (Herdra restarts it)
+#   stalled  a working Pi with no commit or file change for 10 min after working 15 min
+#            (decided by `herdra-checkin --flags`)
+#   idle-unfinished  an idle or done Pi, >= 30 min, with unmerged commits, uncommitted files
+#            or a claimed Task, and no open request to its owner
+#            (also decided by `herdra-checkin --flags`; a Ceph on its main branch never is)
+#   leftover-worktree  a worktree Worktrunk proves merged and clean (state "empty" or
+#            "integrated", every change flag false) with no live terminal in it: its project's Ceph
+#            removes it with wt (wt remove), never by hand
+#   stale-request  an inbox request or blocker open >= 12 h (STALE_REQUEST_HOURS) that no open item
+#            tracks (by its thread link): its sender closes it or chases the recipient
+#   archived-task  an open item linked to an archived Task: Herdra relinks or closes the item
+#   stale-papercut  an active papercut on any project board untouched >= 7 days (STALE_PAPERCUT_DAYS):
+#            its Ceph triages it (close, rescope or park, with evidence); nothing is closed here
+#   answer-unsurfaced  an ask item (herdra-open ask) still owed whose thread got a result or blocked reply
+#            from someone but Herdra newer than the item's last update — herdra-open derives that from the
+#            inbox log as `answered`, and this reads its verdict: the answer arrived and nobody delivered
+#            it (herdra-open deliver) or updated the item. A derived row is display only, not a delivery.
+#   ask-stale  an ask item still on its owner with no update for 12 h (ASK_STALE_HOURS): the owner
+#            is stuck or forgot
+#   owner-replied  an open item (not an ask) whose thread got its owner's reply after the item's last
+#            change — herdra-open derives that as `answered` from the inbox log, and this reads its
+#            verdict: the owner reported the work done or stopped and the row has not moved, so Herdra
+#            closes it or records what remains (task-136, task-139)
+#   quota-near  a provider a role in force uses is at >= 80% of a window (bin/herdra-cutover watch)
+#   quota-switched  it reached >= 90% (or was first seen past it): the watch already cut those roles over
+#            to the matrix's next column with room and asked the running Pis; quota-stuck when none has
+#            room; quota-unknown when a provider in use has no reading. The watch is the one side effect here.
+#   unlinked-item  an In progress item on an agent with no thread link, untouched for 12 h
+#            (STALE_REQUEST_HOURS): its owner's reply cannot move it — Herdra links the request it tracks
+#            (--link thread=<message id>) or closes it (task-136)
+#
+# An owner (open item --on, or inbox request recipient) matches a terminal by hc
+# address, hc name, or project name (the space of a `<space> / main` terminal, on any
+# connected machine: one Ceph per project); `name@machine` looks only on that machine,
+# and is skipped while the machine is not connected. Plain idleness never raises a
+# flag; herdra itself is not judged.
+#
+# Project boards are the cwd of each space's `main` tab, here or on a connected machine (hc exec).
+#
+# Reads: hc ls, hc get (status_ms of blocked terminals), herdra-checkin --flags, herdra-cutover watch, herdra-open list
+# --json (which derives each ask item's answer from the inbox log), inbox open --json, tandem list/show on each board
+# (papercuts and the Tasks open items link to), wt list --format json once per known repo (the
+# leftover-worktree flag), and tailscale status --json for this
+# machine's name. It follows the inbox: the global settings.json `"pi-agency": { "machine" }` when set,
+# else the Tailscale short name. (Work waiting on another machine is not judged here: bin/herdra-online.)
+set -euo pipefail
+
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+ASK_STALE_HOURS=12
+STALE_REQUEST_HOURS=12
+STALE_PAPERCUT_DAYS=7
+
+hcls=$(hc ls --json)
+items=$("$here/herdra-open" list --json)
+inbox=$("$HOME/.pi/agent/scripts/inbox" open --json)
+settings="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/settings.json"
+configured=$(jq -r '."pi-agency".machine // empty' "$settings")
+if [[ -n $configured ]]; then
+  local_name=$configured
+elif command -v tailscale >/dev/null; then
+  local_name=$(tailscale status --json | jq -r '.Self.DNSName | split(".")[0]')
+else
+  echo "herdra-check: cannot name this machine: no \"pi-agency\": { \"machine\" } in $settings and no tailscale" >&2
+  exit 1
+fi
+
+flagged=$("$here/herdra-checkin" --flags)
+
+# An ask item still owed to Algorant: `asked`, and either still In progress on its owner or already
+# carrying herdra-open's derived `answered` (Needs you, kind Read) and not delivered yet. The "an owner
+# replied" predicate has one owner — bin/herdra-open derives it from the inbox log — so this script reads
+# that verdict instead of reading the same thread a second way.
+
+# Every project board (bin/herdra-boards): on each, its active papercuts and the Tasks open items link
+# to, as {project, board, id, title, kind, updatedAt, location}. A cwd outside a Tandem workspace is no
+# board. Here it runs this machine's tandem itself, not its mise shim (an untrusted mise.toml breaks it).
+board_script='
+t=${TANDEM:-tandem}
+out=$("$t" -j list --kind papercut 2>&1) || { case "$out" in *"No Tandem workspace"*) exit 0 ;; esac; echo "$out" >&2; exit 1; }
+{ printf "%s\n" "$out" | jq -r ".data[].id"; for id in "$@"; do echo "$id"; done; } | sort -u | while read -r id; do
+  "$t" -j show "$id" 2>/dev/null | jq -c ".data | {id, title, kind, updatedAt, location}"
+done'
+boards=$("$here/herdra-boards")
+tandem=$(cd / && mise which tandem)
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+n=0
+while IFS=$'\x1f' read -r project m cwd address; do
+  n=$((n + 1))
+  mapfile -t ids < <(jq -r --arg p "$project" '[.[] | select(.closed | not) | .links[]? | select(.kind == "task") | .target
+    | capture("^(?<p>.+):(?<id>task-[0-9-]+)$") | select((.p | ascii_downcase) == ($p | ascii_downcase)) | .id] | unique | .[]' <<<"$items")
+  if [[ -z $m ]]; then
+    (cd "$cwd" && TANDEM=$tandem sh -c "$board_script" sh "${ids[@]}") >"$tmp/$n" 2>"$tmp/$n.err" &
+  else
+    hc exec --on "$m" --cwd "$cwd" -- sh -c "$board_script" sh "${ids[@]}" >"$tmp/$n" 2>"$tmp/$n.err" &
+  fi
+  printf '%s\t%s\n' "$project" "$address" >"$tmp/$n.who"
+done < <(jq -r '.[] | [.project, .machine // "", .cwd, .address] | join("\u001f")' <<<"$boards")
+
+# Each known repo's worktrees, once per repo path: Worktrunk's own verdict (wt is its own reader, no
+# writes). It runs beside the board reads so the added wall time is one wt read, not their sum.
+wn=0
+while IFS=$'\x1f' read -r project m cwd address; do
+  wn=$((wn + 1))
+  if [[ -z $m ]]; then
+    (cd "$cwd" && wt list --format json) >"$tmp/wt.$wn" 2>"$tmp/wt.$wn.err" &
+  else
+    hc exec --on "$m" --cwd "$cwd" -- wt list --format json >"$tmp/wt.$wn" 2>"$tmp/wt.$wn.err" &
+  fi
+  printf '%s\t%s\t%s\n' "$project" "$address" "$m" >"$tmp/wt.$wn.who"
+done < <(jq -r 'group_by(.cwd) | map(.[0]) | .[] | [.project, .machine // "", .cwd, .address] | join("\u001f")' <<<"$boards")
+# The quota watch (herdra-cutover watch): quota-near at 80%; at 90% it cuts the affected roles over
+# to the matrix's next column itself and reports quota-switched (or quota-stuck). Beside the reads above.
+"$here/herdra-cutover" watch >"$tmp/quota" 2>"$tmp/quota.err" &
+wait
+[[ -s "$tmp/quota.err" ]] && echo "herdra-check: $(tail -1 "$tmp/quota.err")" >&2
+quota=$(jq -cs 'if (.[0] | type) == "array" then .[0] else [] end' "$tmp/quota" 2>/dev/null || echo '[]')
+tasks='[]'
+for ((i = 1; i <= n; i++)); do
+  IFS=$'\t' read -r project address <"$tmp/$i.who"
+  [[ -s "$tmp/$i.err" ]] && echo "herdra-check: board of $project ($address) not read: $(tail -1 "$tmp/$i.err")" >&2
+  tasks=$(jq -c --arg p "$project" --arg b "$address" --slurpfile t "$tmp/$i" '. + ($t | map(. + {project: $p, board: $b}))' <<<"$tasks")
+done
+
+# The worktrees Worktrunk calls safe to delete (state "empty" or "integrated", and its changes object
+# says every flag is false — an undetermined null or a missing object is not "clean"), as {project,
+# board, machine, path, branch, since, state}; a repo whose read failed is skipped.
+: >"$tmp/leftovers"
+for ((i = 1; i <= wn; i++)); do
+  IFS=$'\t' read -r project address m <"$tmp/wt.$i.who"
+  if ! jq -e '.items | type == "array"' "$tmp/wt.$i" >/dev/null 2>&1; then
+    if [[ -s "$tmp/wt.$i.err" ]]; then
+      echo "herdra-check: worktrees of $project ($address) not read: $(tail -1 "$tmp/wt.$i.err")" >&2
+    else
+      echo "herdra-check: worktrees of $project ($address) not read: unexpected output" >&2
+    fi
+    continue
+  fi
+  jq -c --arg p "$project" --arg b "$address" --arg m "$m" '
+    .items[]
+    | select(.worktree != null and .worktree.main != true)
+    | (.display.state // "") as $state
+    | select($state == "empty" or $state == "integrated")
+    | select((.worktree.changes | type) == "object")
+    | select(.worktree.changes | .staged == false and .modified == false and .untracked == false
+        and .renamed == false and .deleted == false and .conflicted == false)
+    | {project: $p, board: $b, machine: $m, path: .worktree.path, branch, since: (.head.committed_at // ""), state: $state}' \
+    "$tmp/wt.$i" >>"$tmp/leftovers"
+done
+leftovers=$(jq -s -c '.' "$tmp/leftovers")
+
+# When each blocked terminal's status last changed.
+since='{}'
+for t in $(jq -r '.terminals[] | select(.status == "blocked") | .address' <<<"$hcls"); do
+  ms=$(hc get "$t" --json | jq -r '.status_ms // empty') || continue
+  [[ -n $ms ]] && since=$(jq -c --arg t "$t" --argjson s "$((ms / 1000))" '. + {($t): $s}' <<<"$since")
+done
+
+jq -n -c \
+  --argjson hc "$hcls" --argjson items "$items" --argjson inbox "$inbox" \
+  --argjson stale "$ASK_STALE_HOURS" --arg local "$local_name" --argjson since "$since" --argjson flagged "$flagged" --argjson now "$(date +%s)" \
+  --argjson tasks "$tasks" --argjson reqstale "$STALE_REQUEST_HOURS" --argjson cutstale "$STALE_PAPERCUT_DAYS" --argjson leftovers "$leftovers" --argjson quota "$quota" '
+def ep: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+def dur: if . < 3600 then "\(. / 60 | floor)m" elif . < 86400 then "\(. / 3600 | floor)h\(. % 3600 / 60 | floor)m" else "\(. / 86400 | floor)d\(. % 86400 / 3600 | floor)h" end;
+def clip: if length > 80 then .[0:79] + "…" else . end;
+def flag($kind; $key; $agent; $terminal; $item; $since; $headline):
+  {key: "\($kind):\($key)", kind: $kind, agent: $agent, terminal: $terminal, item: $item, since: ($since | todate), headline: $headline};
+# machine prefix of an hc address ("" for this machine)
+def machine: if contains("/") then split("/")[0] else "" end;
+def space: (.where // "") | split(" / ") | .[0];
+
+[$hc.machines[] | select(.state == "connected") | .name] as $connected
+| [$hc.terminals[] | select(.state == "live") | . + {m: (.address | machine), sp: space, tab: ((.where // "") | split(" / ") | .[1] // "")}] as $live
+# the terminal an owner names on machine $m ("" = this one), or null: its address or hc name, else a
+# project main tab; with $any (no `@machine` given) a project main tab on any connected machine (one
+# Ceph per project). A Pi wins over a shell left in the same place.
+| def find($o; $m; $any): first(
+    ($live | sort_by(.agent != "pi"))[]
+    | select((.m == $m and (.address == (if $m == "" then $o else "\($m)/\($o)" end) or .name == $o))
+        or ((.m == $m or $any) and .tab == "main" and (.sp | ascii_downcase) == ($o | ascii_downcase)))) // null;
+def shell: IN("zsh", "bash", "fish", "sh", "nu", "pwsh");
+
+# who owes Herdra a move: open items owed by an agent, and unanswered inbox requests from herdra
+( [ $items[] | select((.on // "") != "" and (.on | ascii_downcase) != "algorant" and (.on | ascii_downcase) != "herdra")
+    | (.on | split("@")) as $o
+    | {owner: $o[0], m: (if ($o[1] // $local) == $local then "" else $o[1] end), any: ($o[1] == null), ref: .id, at: (.updated // .at | ep), what: .what} ]
+  + [ $inbox[] | select((.kind == "request" or .kind == "blocked") and ((.from.label // "") | ascii_downcase) == "herdra" and (.to.terminal // "") != "")
+      | {owner: .to.terminal, m: (if .to.machine == $local then "" else .to.machine end), any: false, ref: .id, at: (.at | ep), what: .headline} ]
+  | map(select(.m as $m | $m == "" or ($connected | index($m)) != null))
+) as $owes
+| [ $owes | group_by([.m, .owner])[] | sort_by(.at) as $g | $g[0] + {
+      what: ($g[0].what | clip) + (if ($g | length) > 1 then " (+\(($g | length) - 1) more)" else "" end) } ] as $owed
+
+| (
+  # blocked
+  [ $live[] | select(.name != "herdra" and .status == "blocked" and $since[.address] != null and ($now - $since[.address]) >= 120)
+    | (.name // .where // .address) as $who
+    | flag("blocked"; .address; $who; .address; null; $since[.address]; "\($who) is blocked, waiting for input \($now - $since[.address] | dur)") ]
+  # gone and down: an owed agent with no live terminal, or whose terminal is a plain shell (its Pi died)
+  + [ $owed[] | . as $o | find($o.owner; $o.m; $o.any) as $t
+      | (if $o.m == "" then $o.owner else "\($o.owner)@\($o.m)" end) as $who
+      | if $t == null then
+          flag("gone"; $who; $who; null; $o.ref; $o.at; "\($who) is gone (no live terminal) but owes: \($o.what)")
+        elif ($t.agent | shell) then
+          flag("down"; $who; $who; $t.address; $o.ref; $o.at; "\($who) is down (\($t.address) is a plain \($t.agent), no Pi): Herdra restarts its Pi; it owes: \($o.what)")
+        else empty end ]
+  # quota-near, quota-switched, quota-stuck, quota-unknown: from herdra-cutover watch
+  + $quota
+  # silent, stalled and idle-unfinished: judged by herdra-checkin (it names its own thresholds)
+  + [ $flagged[] | flag(.kind; .address; .agent; .address; .item; .since; .headline) ]
+  # leftover-worktree: a worktree Worktrunk proves merged and clean with no live terminal in it (no live
+  # terminal on that machine whose cwd is it or under it): the project Ceph removes it with wt
+  + [ $leftovers[] | . as $l
+      | select([ $live[] | select(.m == $l.machine) | .cwd | strings
+          | select(. == $l.path or startswith($l.path + "/")) ] | length == 0)
+      | (if ($l.project | ascii_downcase) == "herdra" then "Herdra" else "\($l.project) Ceph" end) as $owner
+      | flag("leftover-worktree"; $l.path; $owner; $l.board;
+          null; ($l.since | if . == "" then $now else ep end);
+          "\($l.project): leftover worktree \($l.branch | clip) (merged, clean, no terminal): wt remove it") ]
+  # stale-request: an inbox request or blocker open >= STALE_REQUEST_HOURS that no open item tracks
+  # (an item with its thread link); its sender closes it once its work is done, or chases it
+  + ( [ $items[] | .links[]? | select(.kind == "thread") | .target ] as $tracked
+    | [ $inbox[] | select((.kind == "request" or .kind == "blocked") and ($now - (.at | ep)) >= $reqstale * 3600 and (.id as $id | $tracked | index($id) | not))
+        | ((if (.from.label // "") != "" then .from.label else .from.terminal end) + (if .from.machine == $local then "" else "@\(.from.machine)" end)) as $from
+        | ((if (.to.label // "") != "" then .to.label else .to.terminal end) + (if .to.machine == $local then "" else "@\(.to.machine)" end)) as $to
+        | flag("stale-request"; .id; $from; null; .id; (.at | ep) + $reqstale * 3600;
+            "\(.id) open \($now - (.at | ep) | dur), tracked by no open item: \($from) closes it (inbox close \(.id) <note>) or chases \($to): \(.headline | clip)") ] )
+  # archived-task: an open item linked to an archived Task (its work moved on or finished); Herdra relinks or closes it
+  + [ $items[] | . as $i | $i.links[]? | select(.kind == "task") | .target
+      | capture("^(?<p>.+):(?<id>task-[0-9-]+)$") as $l
+      | first($tasks[] | select((.project | ascii_downcase) == ($l.p | ascii_downcase) and .id == $l.id and .location != "board")) // empty
+      | flag("archived-task"; "\($i.id):\($l.p):\($l.id)"; "herdra"; null; $i.id; (.updatedAt | ep);
+          "\($i.id) links \($l.p):\($l.id), which is archived: Herdra relinks or closes it: \($i.what | clip)") ]
+  # stale-papercut: an active papercut on any board untouched >= STALE_PAPERCUT_DAYS; its Ceph triages it
+  # (close, rescope or park, with evidence: the triage skill staleness check)
+  + [ $tasks[] | select(.kind == "papercut" and .location == "board" and ($now - (.updatedAt | ep)) >= $cutstale * 86400)
+      | (.updatedAt | ep) as $updated
+      | ($now - $updated) as $age
+      | (if (.project | ascii_downcase) == "herdra" then "Herdra" else "\(.project) Ceph" end) as $owner
+      | flag("stale-papercut"; "\(.project):\(.id)"; $owner; .board; null; $updated;
+          "\(.project):\(.id) papercut untouched \($age | dur): \($owner) triages it (close, rescope or park): \(.title | clip)") ]
+  # owner-replied: the owner answered on the thread of the item (herdra-open derives that as `answered`)
+  # and the row is still open. Ask items keep their own answer-unsurfaced flag; this is the plain In
+  # progress case where the work was reported done or stopped and no row moved (task-136).
+  + [ $items[] | select((.answered // null) != null and (.asked // false) != true) | . as $i
+      | ($i.answered.by // $i.on) as $by
+      | flag("owner-replied"; $i.id; $by; null; $i.id; ($i.answered.at | ep);
+          "\($by) replied \([($now - ($i.answered.at | ep)), 0] | max | dur) ago and \($i.id) is still open: Herdra closes it or records what remains: \($i.what | clip)") ]
+  # unlinked-item: an In Progress item on an agent with no thread link, so a reply cannot move it
+  + [ $items[] | select(.section == "progress" and (.on // "") != "")
+      | select([.links[]? | select(.kind == "thread")] | length == 0)
+      | (.updated // .at | ep) as $last
+      | select(($now - $last) >= $reqstale * 3600)
+      | flag("unlinked-item"; .id; .on; null; .id; $last + $reqstale * 3600;
+          "\(.id) has no thread link and is on \(.on) \($now - $last | dur): a reply on its thread cannot move it, so Herdra links the request it tracks (--link thread=m…) or closes it: \(.what | clip)") ]
+  # answer-unsurfaced and ask-stale: ask items still owed to Algorant (in progress, or derived as answered
+  # and not delivered). Herdra-open derives `answered`, so that predicate has one owner.
+  + [ $items[] | select(.asked == true and (.section == "progress" or (.answered // null) != null)) | . as $i
+      | ($i.updated // $i.at | ep) as $last
+      | if ($i.answered // null) != null then
+          # The answerer is the reply sender: on a derived row `on` is Algorant, not the owner.
+          ($i.answered.by // $i.on) as $by
+          | flag("answer-unsurfaced"; $i.id; $by; null; $i.id; ($i.answered.at | ep); "\($by) answered \($i.answered.kind) but \($i.id) is not delivered to Algorant: \($i.what | clip)")
+        elif ($now - $last) >= $stale * 3600 then
+          flag("ask-stale"; $i.id; $i.on; null; $i.id; $last + $stale * 3600; "\($i.id) untouched \($now - $last | dur): \($i.on) owes the answer to: \($i.what | clip)")
+        else empty end ]
+  ) | unique_by(.key) | sort_by(.since, .key)'

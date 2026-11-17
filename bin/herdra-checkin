@@ -1,0 +1,477 @@
+#!/usr/bin/env bun
+/**
+ * herdra-checkin [--json] <target>   a factual progress card, from real sources only
+ * herdra-checkin --flags             JSON array of agents that are SILENT, STALLED or IDLE-UNFINISHED (used by herdra-check)
+ *
+ * <target> is an hc address or name (t1kw, homelab-server/t3, pi-simplification), a project
+ * (a Herdr space: .pi, algOS; checks every Pi in it plus children), or a Task
+ * (task-597, .pi:task-597; checks the card for the Task and every terminal working it).
+ * An address wins over a project, a project over a terminal name (so `herdra` is the project;
+ * use its address for the Ceph alone).
+ *
+ * Per Pi: hc status and how long, age, parent and children; its checkout (branch, commits
+ * ahead of main, newest commit, uncommitted files, diffstat vs main); its Task (the hc `task`
+ * label, else a task id in the worktree name); open inbox requests to/from it; the open herdra-open
+ * items it owes; one verdict:
+ *   WAITING   hc status blocked, or an open request/blocked message from it to its owner (parent,
+ *             starter or Herdra) is unanswered
+ *   SILENT    idle or done, and both that status and its oldest debt >= 15 min old (lib/silent.ts, the
+ *             one SILENT rule, which also marks the item in `herdra-open footer`), not waiting on a
+ *             working child (or, for a Ceph, a working Pi in its space): it owes an open herdra-open
+ *             item (--on its address, hc name, or project for a Ceph, `@machine` for another machine)
+ *             or an open inbox request to it, and nobody is working on it
+ *   IDLE-UNFINISHED  idle or done >= 30 min, not waiting on a working child, with work left: commits
+ *             ahead of main on another branch, uncommitted files (on any branch, except a Ceph on
+ *             main), or a Task still claimed (accord not delivered); and no open request to its owner
+ *             (that is WAITING).
+ *             Open requests it sent to other agents are named as evidence it is stuck. A Pi in a
+ *             `main` tab on its main branch (a Ceph) is idle by design and never flagged.
+ *   STALLED   working >= 15 min and no commit or file change in the last 10 min, not
+ *             waiting on a working child (or, for a Ceph, a working Pi in its space)
+ *   SCOPE?    the diff vs main touches files outside the Task's relatedFiles (else the
+ *             `Scope:` line of its body), where known
+ *   ok        otherwise
+ * An unknown (no checkout, git error) is reported as such and is never judged STALLED.
+ *
+ * Read-only: hc ls/get/exec/machine ls, git, `tandem show`, `inbox open` and `herdra-open list` only. Nothing is sent to or typed
+ * into an agent, no transcript is read, nothing is kept or waited on.
+ */
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { SILENT_S, dur, idOf, machineOf, owners, rawParent, rawSpace, silentAge, waitsOnWork } from "./lib/silent.ts";
+
+const WORKING_S = 15 * 60; // working in one status at least this long ...
+const QUIET_S = 10 * 60; //   ... with no commit or file change this long = STALLED
+const IDLE_S = 30 * 60; //    idle or done this long with work left = IDLE-UNFINISHED
+const inbox = join(homedir(), ".pi/agent/scripts/inbox");
+const repoRoot = join(dirname(Bun.fileURLToPath(import.meta.url)), "..");
+
+function fail(message: string): never {
+  console.error(`herdra-checkin: ${message}`);
+  process.exit(1);
+}
+
+const args = process.argv.slice(2);
+const json = args.includes("--json");
+const flagsMode = args.includes("--flags");
+const rest = args.filter((a) => a !== "--json" && a !== "--flags");
+if (rest.some((a) => a.startsWith("-")) || (flagsMode ? rest.length > 0 : rest.length !== 1)) {
+  fail("usage: herdra-checkin [--json] <hc address|name|project|task-N|project:task-N>\n       herdra-checkin --flags");
+}
+const target = rest[0] ?? "";
+
+// ---------- running things, here or on a connected machine ----------
+
+async function run(machine: string, argv: string[]): Promise<{ ok: boolean; out: string; err: string }> {
+  const proc = Bun.spawn(machine ? ["hc", "exec", "--on", machine, ...argv] : argv, { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+  const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  return { ok: code === 0, out, err: err.trim() };
+}
+const sh = (machine: string, script: string, ...a: string[]) => run(machine, ["sh", "-c", script, "sh", ...a]);
+
+async function hcJson(argv: string[]): Promise<any> {
+  const r = await run("", ["hc", ...argv, "--json"]);
+  if (!r.ok) fail(`hc ${argv.join(" ")}: ${r.err || "failed"}`);
+  return JSON.parse(r.out);
+}
+
+// ---------- formatting ----------
+
+const now = Math.floor(Date.now() / 1000);
+const age = (epochS: number) => `${dur(now - epochS)} ago`;
+const clip = (s: string, n = 90) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+// ---------- hc: terminals and spaces ----------
+
+interface Term {
+  address: string; machine: string; id: string; name: string | null; label: string | null; agent: string;
+  where: string; space: string; tab: string; status: string | null; parent: string | null; task: string | null;
+  cwd: string; statusAt: number; createdAt: number; starter: string | null;
+}
+const label = (t: { name: string | null; label: string | null; where: string; address: string }) => t.name ?? t.label ?? (t.where || t.address);
+
+const ls = await hcJson(["ls"]);
+const live: any[] = ls.terminals.filter((t: any) => t.state === "live");
+
+// `hc ls` is the index; `hc get` has what a card needs (cwd, labels, created and status times).
+async function load(raw: any): Promise<Term> {
+  const g = await hcJson(["get", raw.address]);
+  const machine = machineOf(raw.address);
+  const where: string = g.labels?.where ?? raw.where ?? "";
+  const [space, tab] = where.split(" / ");
+  return {
+    address: raw.address, machine, id: idOf(raw.address), name: g.name ?? null, label: g.labels?.label ?? null,
+    agent: raw.agent ?? "", where, space: space ?? "", tab: tab ?? "", status: g.status?.state ?? null,
+    parent: g.parent ? (g.parent.includes("/") || !machine ? g.parent : `${machine}/${g.parent}`) : null,
+    task: g.labels?.task ?? null, starter: g.labels?.starter ?? null, cwd: g.cwd ?? "",
+    statusAt: Math.floor((g.status_ms ?? 0) / 1000), createdAt: Math.floor((g.created_ms ?? 0) / 1000),
+  };
+}
+
+// ---------- the Pi's checkout ----------
+
+interface Work {
+  error?: string; top?: string; branch?: string; base?: string; ahead?: number; newest?: { at: number; subject: string };
+  head?: { at: number; subject: string }; uncommitted?: number; lastChange?: number; shortstat?: string; files?: string[];
+}
+const GIT = `
+cd "$1" 2>/dev/null || { echo "err=no such directory $1"; exit 0; }
+top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "err=not a git checkout"; exit 0; }
+cd "$top"
+echo "top=$top"
+echo "branch=$(git rev-parse --abbrev-ref HEAD)"
+echo "head=$(git log -1 --format='%ct %s' 2>/dev/null)"
+unc=$({ git -c core.quotepath=off diff --name-only HEAD; git -c core.quotepath=off ls-files -o --exclude-standard; } 2>/dev/null | sort -u)
+echo "uncommitted=$(printf '%s' "$unc" | grep -c .)"
+echo "lastchange=$(printf '%s\n' "$unc" | while IFS= read -r f; do stat -c %Y "$f" 2>/dev/null; done | sort -n | tail -1)"
+if git rev-parse --verify -q refs/heads/main >/dev/null; then
+  mb=$(git merge-base main HEAD)
+  echo "base=main"
+  echo "ahead=$(git rev-list --count main..HEAD)"
+  echo "newest=$(git log -1 --format='%ct %s' main..HEAD)"
+  echo "shortstat=$(git diff --shortstat "$mb")"
+  echo "@@files"
+  { git -c core.quotepath=off diff --name-only "$mb"; git -c core.quotepath=off ls-files -o --exclude-standard; } 2>/dev/null | sort -u
+fi
+`;
+const timed = (v: string) => {
+  const m = /^(\d+) (.*)$/.exec(v);
+  return m ? { at: Number(m[1]), subject: m[2] } : undefined;
+};
+async function work(t: Term): Promise<Work> {
+  const r = await sh(t.machine, GIT, t.cwd);
+  if (!r.ok) return { error: `git on ${t.machine || "this machine"} failed: ${r.err || "no output"}` };
+  const [head, filesPart] = r.out.split("\n@@files\n");
+  const kv: Record<string, string> = {};
+  for (const line of head.split("\n")) {
+    const i = line.indexOf("=");
+    if (i > 0) kv[line.slice(0, i)] = line.slice(i + 1);
+  }
+  if (kv.err) return { error: kv.err };
+  const w: Work = { top: kv.top, branch: kv.branch, head: timed(kv.head ?? ""), uncommitted: Number(kv.uncommitted), lastChange: kv.lastchange ? Number(kv.lastchange) : undefined };
+  if (kv.base) {
+    w.base = kv.base;
+    w.ahead = Number(kv.ahead);
+    w.newest = timed(kv.newest ?? "");
+    w.shortstat = kv.shortstat?.trim() || undefined;
+    w.files = (filesPart ?? "").split("\n").filter(Boolean);
+  } else {
+    w.error = "no main branch to compare against";
+  }
+  return w;
+}
+// the newest commit that is this checkout's own (ahead of main, or HEAD on main itself) and the newest file change
+function lastActivity(w: Work): number | undefined {
+  const commit = w.base && w.branch === w.base ? w.head?.at : w.newest?.at;
+  const times = [commit, w.lastChange].filter((x): x is number => x !== undefined);
+  return times.length ? Math.max(...times) : undefined;
+}
+
+// ---------- Task ----------
+
+interface TaskInfo {
+  ref: string; id: string; error?: string; title?: string; state?: string; accord?: string; assignee?: string | null; location?: string;
+  claimedAt?: number; updatedAt?: number; subtasks?: number; scope?: string[]; scopeFrom?: string;
+}
+const TASK_ID = /\btask-\d+(?:-\d+)?\b/;
+const epoch = (iso?: string | null) => (iso ? Math.floor(Date.parse(iso) / 1000) : undefined);
+
+async function taskInfo(ref: string, machine: string, dir: string): Promise<TaskInfo> {
+  const id = ref.includes(":") ? ref.slice(ref.lastIndexOf(":") + 1) : ref;
+  const r = await sh(machine, 'cd "$1" 2>/dev/null && tandem -j show "$2"', dir, id);
+  let d: any;
+  try { d = JSON.parse(r.out)?.data; } catch { /* reported below */ }
+  if (!r.ok || !d) return { ref, id, error: `tandem show ${id} in ${dir} failed: ${r.err || r.out.trim().slice(0, 120) || "no output"}` };
+  const info: TaskInfo = {
+    ref, id, title: d.title, state: d.state, accord: d.accordStatus, assignee: d.assignee, location: d.location,
+    claimedAt: epoch(d.accord?.claimedAt), updatedAt: epoch(d.updatedAt), subtasks: Array.isArray(d.children) ? d.children.length : 0,
+  };
+  if (Array.isArray(d.relatedFiles) && d.relatedFiles.length) {
+    info.scope = d.relatedFiles;
+    info.scopeFrom = "relatedFiles";
+  } else {
+    const m = /^>?\s*Scope:\s*(.+)$/m.exec(d.body ?? "");
+    if (m) {
+      info.scope = m[1].split(",").map((s) => s.trim().replace(/^`|`$/g, "").replace(/\.$/, "")).filter(Boolean);
+      info.scopeFrom = "Scope line";
+    }
+  }
+  return info;
+}
+const inScope = (f: string, scope: string[]) =>
+  scope.some((s) => (/[*?]/.test(s) ? new Bun.Glob(s).match(f) : f === s || f.startsWith(s.endsWith("/") ? s : `${s}/`)));
+
+// where a Pi's Task board is: its own checkout when the Task is of its project, else the project's `main` tab
+function boardDir(t: Term, project: string): { machine: string; dir: string } | string {
+  if (!project || !t.space || project.toLowerCase() === t.space.toLowerCase()) return { machine: t.machine, dir: t.cwd };
+  const main = live.find((x) => x.agent === "pi" && machineOf(x.address) === t.machine && rawSpace(x).toLowerCase() === project.toLowerCase() && (x.where ?? "").endsWith(" / main"));
+  return main ? { machine: t.machine, dir: main.cwd } : `no terminal in project ${project}'s main tab to locate its board`;
+}
+
+// ---------- inbox ----------
+
+let inboxOpen: any[] | undefined;
+async function openInbox(): Promise<any[]> {
+  if (!inboxOpen) {
+    const r = await run("", [inbox, "open", "--json"]);
+    if (!r.ok) fail(`inbox open: ${r.err || "failed"}`);
+    inboxOpen = JSON.parse(r.out);
+  }
+  return inboxOpen;
+}
+// Each machine's hc core id ("" is this machine): an envelope names its terminals by core, while its
+// `machine` is the sender's own label for a machine (homelab-server), not always the hc machine name (homelab-server).
+let cores: Map<string, string> | undefined;
+async function coreOf(machine: string): Promise<string> {
+  if (!cores) {
+    const [server, machines] = await Promise.all([hcJson(["server", "status"]), hcJson(["machine", "ls"])]);
+    cores = new Map([["", server.core.id], ...machines.machines.map((m: any) => [m.name, m.id] as [string, string])]);
+  }
+  return cores.get(machine) ?? fail(`no core id for hc machine ${machine}`);
+}
+interface InboxItem { dir: "to" | "from"; id: string; kind: string; party: string; at: number; headline: string; toOwner: boolean }
+async function inboxFor(t: Term): Promise<InboxItem[]> {
+  const core = await coreOf(t.machine);
+  // parent is an address; starter may be an hc name, resolved on its machine
+  const owners = await Promise.all([t.parent, t.starter].filter((o): o is string => !!o).map(async (o) => {
+    const m = machineOf(o) || t.machine;
+    const named = live.find((x) => machineOf(x.address) === m && x.name === idOf(o));
+    return { core: await coreOf(m), id: named ? idOf(named.address) : idOf(o) };
+  }));
+  const items: InboxItem[] = [];
+  for (const i of await openInbox()) {
+    const to = i.to?.core === core && i.to?.terminal === t.id;
+    const from = i.from?.core === core && i.from?.terminal === t.id;
+    if (to || from) {
+      const other = to ? i.from : i.to;
+      // a question is a request to its owner: its parent, its starter, or Herdra (a Ceph's route)
+      const owner = owners.some((o) => o.core === i.to?.core && o.id === i.to?.terminal)
+        || String(i.to?.label).toLowerCase() === "herdra";
+      items.push({ dir: to ? "to" : "from", id: i.id, kind: i.kind, party: other?.label ?? other?.terminal ?? "?", at: epoch(i.at) as number, headline: i.headline, toOwner: !to && owner });
+    }
+  }
+  return items;
+}
+
+// ---------- what it owes Herdra ----------
+
+// Open herdra-open items on an agent (section progress); how an `on` names a terminal is lib/silent.ts's
+// `owners`, the same rule bin/herdra-silent marks the item with.
+interface Debt { id: string; at: number; what: string }
+let openItems: any[] | undefined;
+async function itemsOwed(t: Term): Promise<Debt[]> {
+  if (!openItems) {
+    const r = await run("", [join(repoRoot, "bin/herdra-open"), "list", "--json"]);
+    if (!r.ok) fail(`herdra-open list: ${r.err || "failed"}`);
+    openItems = JSON.parse(r.out).filter((o: any) => o.section === "progress");
+  }
+  return openItems.filter((o) => owners(String(o.on ?? ""), live).some((x) => x.address === t.address))
+    .map((o) => ({ id: o.id, at: epoch(o.updated ?? o.at) as number, what: o.what }));
+}
+
+// ---------- the verdict (the one place SILENT, STALLED and IDLE-UNFINISHED are decided) ----------
+
+interface Agent {
+  term: Term; children: { address: string; name: string; status: string | null }[]; work: Work; task: TaskInfo | null;
+  inbox: InboxItem[]; owes: Debt[]; verdict: "ok" | "WAITING" | "SILENT" | "IDLE-UNFINISHED" | "STALLED" | "SCOPE?"; why: string; since?: number; item?: string;
+}
+const workingFor = (t: Term) => (t.status === "working" ? now - t.statusAt : 0);
+
+function judge(a: Omit<Agent, "verdict" | "why" | "since" | "item">): Pick<Agent, "verdict" | "why" | "since" | "item"> {
+  const t = a.term;
+  if (t.status === "blocked") return { verdict: "WAITING", why: `hc status blocked for ${dur(now - t.statusAt)}` };
+  const asked = a.inbox.find((i) => i.toOwner && (i.kind === "request" || i.kind === "blocked"));
+  if (asked) return { verdict: "WAITING", why: `open ${asked.kind} to ${asked.party} for ${dur(now - asked.at)}: ${clip(asked.headline, 60)}` };
+  let note = "";
+  // it owes an open item or an open request to it, and nothing is moving on it
+  const debts = [...a.owes, ...a.inbox.filter((i) => i.dir === "to" && (i.kind === "request" || i.kind === "blocked")).map((i) => ({ id: i.id, at: i.at, what: `${i.kind} from ${i.party}: ${i.headline}` }))]
+    .sort((x, y) => x.at - y.at);
+  const silent = debts.length ? silentAge(t, debts[0].at, live, now) : undefined;
+  if (silent !== undefined) {
+    const since = Math.max(t.statusAt, debts[0].at);
+    return {
+      verdict: "SILENT", since: since + SILENT_S, item: debts[0].id,
+      why: `${t.status} ${dur(silent)} and owes ${debts[0].id}: ${clip(debts[0].what, 70)}${debts.length > 1 ? ` (+${debts.length - 1} more)` : ""}`,
+    };
+  }
+  if ((t.status === "idle" || t.status === "done") && t.statusAt && now - t.statusAt >= IDLE_S && !waitsOnWork(t, live)) {
+    const w = a.work;
+    const ceph = t.tab === "main" && w.base !== undefined && w.branch === w.base;
+    const left: string[] = [];
+    if (w.base && w.branch !== w.base && w.ahead) left.push(`${w.ahead} unmerged commit${w.ahead === 1 ? "" : "s"} on ${w.branch}`);
+    if (w.base && w.uncommitted) left.push(`${w.uncommitted} uncommitted file${w.uncommitted === 1 ? "" : "s"}${w.branch === w.base ? ` on ${w.branch}` : ""}`);
+    if (a.task?.accord === "claimed" && a.task.location !== "archived") left.push(`${a.task.id} still claimed`);
+    if (!ceph && left.length) {
+      const other = a.inbox.filter((i) => i.dir === "from" && !i.toOwner && (i.kind === "request" || i.kind === "blocked"));
+      const oldest = other.length ? Math.min(...other.map((i) => i.at)) : undefined;
+      return {
+        verdict: "IDLE-UNFINISHED", since: t.statusAt + IDLE_S,
+        why: `${t.status} ${dur(now - t.statusAt)} with ${left.join(", ")}`
+          + (other.length ? `; its ${other.length} open request${other.length > 1 ? "s" : ""} to ${[...new Set(other.map((i) => i.party))].join(", ")} (oldest ${dur(now - (oldest as number))}) are not its owner's, so it is stuck, not waiting` : ""),
+      };
+    }
+  }
+  if (workingFor(t) >= WORKING_S) {
+    const last = lastActivity(a.work);
+    if (waitsOnWork(t, live)) note = "working on a working child or space mate; not judged stalled";
+    else if (a.work.error && last === undefined) note = `activity unknown (${a.work.error}); not judged`;
+    else {
+      const quiet = last === undefined ? Infinity : now - last;
+      if (quiet >= QUIET_S) {
+        const since = Math.max(t.statusAt + WORKING_S, last === undefined ? 0 : last + QUIET_S);
+        return { verdict: "STALLED", why: `working ${dur(workingFor(t))}, ${last === undefined ? "no commit or file change found" : `last commit or file change ${dur(quiet)} ago`}`, since };
+      }
+    }
+  }
+  const scope = a.task?.scope;
+  if (scope?.length && a.work.files) {
+    const out = a.work.files.filter((f) => !inScope(f, scope));
+    if (out.length) return { verdict: "SCOPE?", why: `${out.length} changed file${out.length > 1 ? "s" : ""} outside ${a.task!.id} ${a.task!.scopeFrom}: ${clip(out.slice(0, 4).join(", "), 100)}${out.length > 4 ? ", …" : ""}` };
+  }
+  return { verdict: "ok", why: note };
+}
+
+async function collect(t: Term): Promise<Agent> {
+  const children = live.filter((x) => rawParent(x) === t.address).map((x) => ({ address: x.address, name: x.name ?? x.where ?? x.address, status: x.status ?? null }));
+  const w = await work(t);
+  // Task: the hc label, else a task id in the worktree name
+  let ref = t.task;
+  if (!ref) {
+    const m = TASK_ID.exec(`${w.branch ?? ""} ${t.cwd.split("/").pop()}`);
+    if (m) ref = m[0];
+  }
+  let task: TaskInfo | null = null;
+  if (ref) {
+    const board = boardDir(t, ref.includes(":") ? ref.slice(0, ref.lastIndexOf(":")) : "");
+    task = typeof board === "string" ? { ref, id: ref, error: board } : await taskInfo(ref, board.machine, board.dir);
+  }
+  const part = { term: t, children, work: w, task, inbox: await inboxFor(t), owes: await itemsOwed(t) };
+  return { ...part, ...judge(part) };
+}
+
+// ---------- --flags: the cheap pass for herdra-check ----------
+
+if (flagsMode) {
+  const out = [];
+  const candidates = live.filter((t) => t.agent === "pi" && t.name !== "herdra" && ["working", "idle", "done"].includes(t.status));
+  for (const raw of candidates) {
+    const t = await load(raw);
+    if (t.status === "working" ? workingFor(t) < WORKING_S : now - t.statusAt < SILENT_S) continue;
+    const a = await collect(t);
+    if (a.verdict === "SILENT") out.push({ kind: "silent", address: t.address, agent: label(t), since: a.since, item: a.item, headline: `${label(t)} is silent: ${a.why}` });
+    if (a.verdict === "STALLED") out.push({ kind: "stalled", address: t.address, agent: label(t), since: a.since, headline: `${label(t)} looks stalled: ${a.why}` });
+    if (a.verdict === "IDLE-UNFINISHED") out.push({ kind: "idle-unfinished", address: t.address, agent: label(t), since: a.since, headline: `${label(t)} stopped unfinished: ${a.why}` });
+  }
+  console.log(JSON.stringify(out));
+  process.exit(0);
+}
+
+// ---------- target resolution ----------
+
+const taskMatch = /^(?:(.+):)?(task-\d+(?:-\d+)?)$/.exec(target);
+let kind: "terminal" | "project" | "task";
+let rawAgents: any[];
+let taskRef: { project: string; id: string } | null = null;
+const byAddress = live.filter((t) => t.address === target);
+const projectPis = live.filter((t) => rawSpace(t).toLowerCase() === target.toLowerCase() && target !== "");
+if (taskMatch) {
+  kind = "task";
+  taskRef = { project: taskMatch[1] ?? "", id: taskMatch[2] };
+  const same = (label: string | null | undefined) => !!label && (label === target || (!taskRef!.project && label.endsWith(`:${taskRef!.id}`)));
+  const cwdTask = (t: any) => (!taskRef!.project ? new RegExp(`\\b${taskRef!.id}\\b(?!-\\d)`).test(String(t.cwd ?? "").split("/").pop()) : false);
+  const pis = live.filter((t) => t.agent === "pi");
+  const labelled = await Promise.all(pis.map(async (t) => ({ t, label: (await hcJson(["get", t.address])).labels?.task as string | undefined })));
+  rawAgents = labelled.filter(({ t, label: l }) => same(l) || cwdTask(t)).map(({ t }) => t);
+} else if (byAddress.length) {
+  kind = "terminal";
+  rawAgents = byAddress;
+} else if (projectPis.length) {
+  kind = "project";
+  const space = projectPis.filter((t) => t.agent === "pi");
+  const inSpace = new Set(space.map((t) => t.address));
+  // plus every child of one of them, wherever it runs
+  rawAgents = [...space, ...live.filter((t) => t.agent === "pi" && !inSpace.has(t.address) && rawParent(t) && inSpace.has(rawParent(t) as string))];
+  if (!rawAgents.length) fail(`project ${target} has no Pi terminal`);
+} else {
+  const named = live.filter((t) => t.name === target);
+  if (!named.length) fail(`${target}: no live hc terminal address or name, project (space) or task id matches it`);
+  kind = "terminal";
+  rawAgents = named;
+}
+
+const agents = await Promise.all((await Promise.all(rawAgents.map(load))).map(collect));
+
+// a Task target is checked on its own first
+let taskCard: TaskInfo | null = null;
+if (taskRef) {
+  let board: { machine: string; dir: string } | string;
+  if (agents.length) board = boardDir(agents[0].term, taskRef.project);
+  else if (!taskRef.project) board = { machine: "", dir: repoRoot };
+  else {
+    const main = live.find((x) => x.agent === "pi" && !machineOf(x.address) && rawSpace(x).toLowerCase() === taskRef!.project.toLowerCase() && (x.where ?? "").endsWith(" / main"));
+    board = main ? { machine: "", dir: main.cwd } : `no terminal in project ${taskRef.project}'s main tab to locate its board`;
+  }
+  taskCard = typeof board === "string" ? { ref: target, id: taskRef.id, error: board } : await taskInfo(target, board.machine, board.dir);
+}
+
+// ---------- output ----------
+
+const rank = { WAITING: 0, SILENT: 1, "IDLE-UNFINISHED": 2, STALLED: 3, "SCOPE?": 4, ok: 5 } as const;
+agents.sort((x, y) => rank[x.verdict] - rank[y.verdict] || (x.term.where + x.term.address).localeCompare(y.term.where + y.term.address));
+
+const iso = (s: number) => new Date(s * 1000).toISOString().replace(/\.\d+Z$/, "Z");
+if (json) {
+  console.log(JSON.stringify({
+    target, kind, now: iso(now), task: taskCard,
+    agents: agents.map((a) => ({
+      address: a.term.address, name: a.term.name, label: a.term.label, agent: a.term.agent, where: a.term.where, cwd: a.term.cwd,
+      status: a.term.status, statusSince: a.term.statusAt ? iso(a.term.statusAt) : null, statusAgeS: a.term.statusAt ? now - a.term.statusAt : null,
+      startedAt: a.term.createdAt ? iso(a.term.createdAt) : null, ageS: a.term.createdAt ? now - a.term.createdAt : null,
+      parent: a.term.parent, children: a.children, work: a.work, task: a.task,
+      inbox: a.inbox.map((i) => ({ ...i, at: iso(i.at) })), owes: a.owes.map((d) => ({ ...d, at: iso(d.at) })), verdict: a.verdict, why: a.why || null,
+    })),
+  }, null, 2));
+  process.exit(0);
+}
+
+const taskLines = (t: TaskInfo) =>
+  t.error ? `Task:    ${t.ref} unavailable: ${t.error}`
+    : `Task:    ${t.ref} ${t.state}${t.location === "archived" ? " (archived)" : ""} / accord ${t.accord}${t.assignee ? ` / ${t.assignee}` : ""}`
+      + `${t.claimedAt ? ` / claimed ${age(t.claimedAt)}` : ""}${t.updatedAt ? ` / updated ${age(t.updatedAt)}` : ""}${t.subtasks ? ` / ${t.subtasks} subtasks` : ""}: ${clip(t.title ?? "", 70)}`;
+
+const lines: string[] = [];
+if (kind === "project") {
+  const flagged = agents.filter((a) => a.verdict !== "ok");
+  lines.push(`## ${target}: ${agents.length} Pi${agents.length > 1 ? "s" : ""}, ${flagged.length ? `${flagged.length} flagged (${flagged.map((a) => `${label(a.term)} ${a.verdict}`).join(", ")})` : "all ok"}`, "");
+}
+if (taskCard) {
+  lines.push(`## ${target}`, taskLines(taskCard), agents.length ? "" : "No live terminal is working it.");
+}
+for (const a of agents) {
+  const t = a.term;
+  const w = a.work;
+  lines.push(`**${label(t)} (${t.address})** — ${t.agent}, ${t.where || "no space"}`);
+  lines.push(`hc:      ${t.status ?? "no status"}${t.statusAt ? ` for ${dur(now - t.statusAt)}` : ""}${t.createdAt ? ` · started ${age(t.createdAt)}` : ""}`
+    + ` · parent ${t.parent ?? "none"} · children ${a.children.length ? a.children.map((c) => `${c.name} ${c.status ?? "?"}`).join(", ") : "none"}`);
+  if (w.error && !w.branch) lines.push(`Work:    unavailable: ${w.error}`);
+  else {
+    const parts = [`${w.branch}${w.base ? ` · ${w.ahead} commit${w.ahead === 1 ? "" : "s"} ahead of ${w.base}` : ` · ${w.error}`}`];
+    if (w.newest) parts.push(`newest "${clip(w.newest.subject, 60)}" ${age(w.newest.at)}`);
+    else if (w.head && w.branch === w.base) parts.push(`HEAD "${clip(w.head.subject, 60)}" ${age(w.head.at)}`);
+    parts.push(`${w.uncommitted} uncommitted file${w.uncommitted === 1 ? "" : "s"}${w.lastChange ? ` (latest ${age(w.lastChange)})` : ""}`);
+    if (w.shortstat) parts.push(`vs main: ${w.shortstat}`);
+    lines.push(`Work:    ${parts.join(" · ")}`);
+  }
+  if (!(kind === "task" && a.task?.id === taskRef!.id)) lines.push(a.task ? taskLines(a.task) : "Task:    none (no task label, no task id in the worktree name)");
+  const box = (dir: "to" | "from") => {
+    const items = a.inbox.filter((i) => i.dir === dir).sort((x, y) => x.at - y.at);
+    return items.length
+      ? `${items.length} open ${dir === "to" ? "to it" : "from it"}: ${items.slice(0, 3).map((i) => `${i.kind} ${dir === "to" ? "from" : "to"} ${i.party} ${dur(now - i.at)}: ${clip(i.headline, 60)}`).join(" | ")}${items.length > 3 ? ` | +${items.length - 3} more` : ""}`
+      : "";
+  };
+  const boxes = [box("from"), box("to")].filter(Boolean);
+  lines.push(boxes.length ? boxes.map((b, n) => `${n ? "         " : "Inbox:   "}${b}`).join("\n") : "Inbox:   no open requests to or from it");
+  if (a.owes.length) lines.push(`Owes:    ${a.owes.map((d) => `${d.id} ${dur(now - d.at)}: ${clip(d.what, 60)}`).join(" | ")}`);
+  lines.push(`Verdict: ${a.verdict}${a.why ? ` — ${a.why}` : ""}`, "");
+}
+console.log(lines.join("\n").trimEnd());

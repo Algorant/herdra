@@ -1,0 +1,69 @@
+#!/usr/bin/env bun
+/**
+ * herdra-silent   mark the In progress items whose agent went idle while it still owed them
+ *
+ * Reads `herdra-open list`'s items (a JSON array) on stdin and prints the same items, each In progress
+ * one whose agent is SILENT (lib/silent.ts, the rule herdra-checkin judges an agent with) carrying
+ * `silent: {status, at, age, mark}`: `status` is hc's own (idle or done), `at` the status start, `age`
+ * seconds, and `mark` the one line every reader prints, "idle 58m" — never the raw status, which for a
+ * done Pi would read as "the work is done" when it means the opposite. Nothing else in an item changes.
+ * An agent that is working, or whose child (or, for a Ceph, a Pi in its space) is working, is not marked.
+ *
+ * Read-only: one `hc ls`, then one `hc get` per idle or done owner, nothing kept, no timer. Fails
+ * clearly (exit 1) when hc cannot be read: an unmarked list must never look like a quiet one.
+ * Used by `herdra-open list --json` and `herdra-open footer`, so the window and the footer agree.
+ */
+import { dur, idOf, machineOf, owners, silentAge } from "./lib/silent.ts";
+
+const input = await new Response(Bun.stdin.stream()).text();
+const items: any[] = input.trim() ? JSON.parse(input) : [];
+
+async function hc(argv: string[]): Promise<any> {
+  const p = Bun.spawn(["hc", ...argv], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+  if (code !== 0) {
+    console.error(`herdra-silent: hc ${argv.join(" ")}: ${err.trim() || `exit ${code}`}`);
+    process.exit(1);
+  }
+  return JSON.parse(out);
+}
+
+const now = Math.floor(Date.now() / 1000);
+const ls = await hc(["ls", "--json"]);
+const live: any[] = ls.terminals.filter((t: any) => t.state === "live");
+
+// A terminal's status and when it started: hc get, once per address.
+const got = new Map<string, any>();
+async function termOf(raw: any) {
+  if (!got.has(raw.address)) got.set(raw.address, await hc(["get", raw.address, "--json"]));
+  const g = got.get(raw.address);
+  const where: string = g.labels?.where ?? raw.where ?? "";
+  const [space = "", tab = ""] = where.split(" / ");
+  return {
+    address: raw.address, machine: machineOf(raw.address), id: idOf(raw.address), agent: raw.agent ?? "", where, space, tab,
+    status: g.status?.state ?? null, statusAt: Math.floor((g.status_ms ?? 0) / 1000),
+    parent: raw.parent ?? null,
+  };
+}
+
+// An item's time as epoch seconds; now when it cannot be read, so a malformed record is never marked.
+const epoch = (iso?: string | null) => {
+  const s = Date.parse(String(iso ?? ""));
+  return Number.isFinite(s) ? Math.floor(s / 1000) : Math.floor(Date.now() / 1000);
+};
+
+for (const item of items) {
+  if (item?.section !== "progress") continue;
+  const owedSince = epoch(item.updated ?? item.at);
+  const candidates = owners(String(item.on ?? ""), live)
+    .filter((t: any) => t.agent === "pi" && (t.status === "idle" || t.status === "done"));
+  for (const raw of candidates) {
+    const t = await termOf(raw);
+    const age = silentAge(t, owedSince, live, now);
+    if (age === undefined) continue;
+    item.silent = { status: t.status, at: new Date(t.statusAt * 1000).toISOString(), age, mark: `idle ${dur(age)}` };
+    break;
+  }
+}
+
+console.log(JSON.stringify(items));

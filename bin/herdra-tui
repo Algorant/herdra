@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Open Tandem's TUI on Herdra's board, with every open project board added to
+# its session working set. One `hc ls` at launch; nothing is saved or kept in
+# sync. A project counts when a local terminal sits in its space's `main` tab
+# (its Ceph's place) and that terminal's cwd holds a Tandem board.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+args=()
+while IFS= read -r dir; do
+  [ "$dir" = "$here" ] && continue
+  [ -d "$dir/.tandem" ] && args+=(--add-workspace "$dir")
+done < <(hc ls --json | jq -r '
+  .terminals[]
+  | select((.address | contains("/") | not) and (.where | endswith(" / main")))
+  | .cwd' | sort -u)
+
+cd "$here"
+exec tandem tui "${args[@]}"

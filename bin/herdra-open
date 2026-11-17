@@ -1,0 +1,561 @@
+#!/usr/bin/env bash
+# Herdra's open items: handoffs awaiting a reply, promises to Algorant, and
+# decisions he owes. Append-only JSON lines; an item is open until a close
+# line for its id is appended. This is the one source of Herdra's reply footer
+# (`herdra-open footer`) and of the Herdra window (`list --json --closed 24h`).
+#
+# --on O     who owes the next move: an hc name or address, a project (its Ceph), `algorant`, `herdra`, or
+#            `name@machine` for an agent on another machine. herdra-check reads it.
+# --waiting  free-text description of what is awaited.
+# Work waiting on another machine is not an item here: its owner tags its Tandem Task needs-<host>
+# (bin/herdra-online); the footer's Pending lists those Tasks from `herdra-online --list`.
+#
+# Optional, for what the footer and the window's detail view show:
+# --ask TEXT      his words, verbatim (markdown): the context, what is asked or needs deciding. Stored
+#                 as `words`, and as the detail view's `ask` until an answer is delivered over it
+# --option TEXT   one choice, in order, repeatable ("Title — detail"); on update the
+#                 repeated options replace the whole list
+# --rec TEXT      Herdra's recommendation; starting with an option's letter ("A. …") marks it
+# --link K=T      repeatable, replaces the list on update. K: task (Project:task-id), post (URL),
+#                 agent (hc address: t27 or machine/t3), thread (inbox message id), file (path)
+# --kind K        Decide | Approve | Check | Read
+# --rank N        integer; lower first (Needs you and Up next order)
+#
+# Section (computed here so the footer and the window agree): --pending: pending
+# (Pending, last: waits on a time, nobody's move); parked, or on herdra: next (Up next); on algorant: you (Needs you); any other on:
+# progress (In progress); closed: done.
+#
+#   herdra-open add --project P --on O --waiting W --closes C [--pending] [--supersedes ID] [optional fields] "what is open"
+#                          A row that waits on Algorant (--on algorant, not --pending) needs --ask: the row
+#                          line is the move, --ask is what he is deciding. --kind Decide also needs its
+#                          --option list and --rec, so the list and the footer never show a terse title
+#                          whose choices live only in the chat. Nothing is rewritten retroactively.
+#                          When no --supersedes is given, an open item on the same project that carries
+#                          this row's subject or two of its words is named on stderr with both exits
+#                          (--supersedes it, or close it): the nudge, never a change on that guess.
+#                          --supersedes: this item replaces open item ID (a widened or redirected request):
+#                          ID is closed ("Superseded by …") and its thread requests still open in the inbox,
+#                          other than this item's own, are closed as superseded. One item per piece of work.
+#   herdra-open update ID [--on O] [--waiting W] [--closes C] [--parked|--unparked] [--pending|--unpending] [optional fields] ["what is open"]
+#                          --parked sets `parked: true` (the item moves to Up next)
+#                          --pending sets `pending: true` (the item moves to Pending); --unpending undoes it
+#   herdra-open close ID ["what closed it"]
+#   herdra-open answer ID "Algorant's answer"
+#                          one step for a gate: reply (result, reply_to the item's thread link) to the
+#                          other party of that message, close the item with the answer as its note, and
+#                          note the answer in its herdra Task; a Task on another board is named in the
+#                          reply for its owner to record. Fails, changing nothing, without a thread link.
+#                          That party is found by its core id (an inbox label like homelab-server is not an hc
+#                          machine name). If its terminal is gone, the answer goes to the item's --on agent,
+#                          else the item project's Ceph; if that is this terminal, nothing is sent and the
+#                          thread is closed with the answer as its note.
+#
+# Asks: every request Algorant makes (one item per part of a multi-part request, his words verbatim in
+# --ask) is tracked until he has seen the answer; the row line is the move, his words are the context.
+# An ask item cannot be closed any other way.
+#   herdra-open ask "<short line: the move>" --ask "<his words, verbatim>" --project P --on OWNER --thread MSG [--supersedes ID] [--link K=T]… [--rank N]
+#                          one ask item, In progress on its owner; --ask is required (the row says the
+#                          move, never his words); --thread is the inbox request that carries the
+#                          question (herdra-check watches it for an unsurfaced answer)
+#   herdra-open deliver ID --link post=URL|file=PATH [--link K=T]… "<one-line answer>"
+#                          the answer is in: the item moves to Needs you as kind Read, with the answer
+#                          and the link (research answers are a Sideshow post, not only a file)
+#   herdra-open seen ID    Algorant has seen the delivered answer: closes it, the answer is the Done note
+#   herdra-open close ID --drop "reason"   the only other way out: an ask he withdrew
+#                          (`close` and `answer` without it are refused for an ask item)
+#   herdra-open list [--json [--closed Nh|Nd]]
+#                          --json: open items, each with `section` and `history` (its log lines);
+#                          --closed adds items closed within that time (`closed: {at, note}`)
+#   herdra-open footer     Herdra's reply footer lines; nothing when there is nothing to show
+#                          (a Needs-you item carries its recommendation after the row, `— A. …`; an
+#                          answered one the reply's headline; a Read item its post/file link. An
+#                          In progress owner whose terminal is a plain shell is marked down, one with
+#                          no live terminal gone)
+#
+# An In progress item whose agent is SILENT — idle or done while it still owes it, and nothing working
+# under it (lib/silent.ts, the rule herdra-checkin judges an agent with) — carries `silent: {status, at,
+# age, mark}` in `list` and `--json`, and the footer prints its `mark`: always " (idle 58m)", whatever hc
+# calls the status, which `status` keeps. Both read it from bin/herdra-silent, so the footer and the
+# Herdra window show the same mark.
+#
+# An In progress item that carries a `thread` link and whose thread got the owner's reply (result or
+# blocked, not from Herdra) after the item's last change is shown as answered: Needs you, kind Read, the
+# reply's headline as `answer`, `answered: {message, at, kind, by}`, with the answered item's own
+# `--ask`-era fields (`rec`, `options`) dropped so a reader never shows a stale recommendation beside the
+# answer. It is derived from the inbox log when the list is read and never written: the record keeps its
+# `on`, no `delivered` is set, and the row moves back by itself when the item moves. A derived row is not
+# a delivery: an ask item's answer is still delivered with a post or file and then `seen`, so
+# herdra-check keeps naming a derived ask item through answer-unsurfaced until that happens, and the
+# Needs-you desk cards skip a derived row (it is Herdra's cue, not a new notification).
+#
+# What a read pays for it (task-121, Algorant's limit: no measurable cost when nothing changed): one
+# `grep` of the record for a `thread` link, and nothing else, while no item has one; then one `stat` of
+# the inbox log and one `grep` of it for those thread ids; and one `jq` only when a reply matched. The
+# patch runs inside the fold's own `jq` (empty `replies` makes it a no-op), so nothing is serialized and
+# no second reader process is added. The log scan is linear and only runs while a thread-linked item is
+# open; one that finds nothing changes nothing, and an unreadable log or reply line is reported on stderr
+# with the list shown as before rather than failing a reader that only displays.
+set -euo pipefail
+
+file="${XDG_STATE_HOME:-$HOME/.local/state}/herdra/open.jsonl"
+bindir=$(cd "$(dirname "$0")" && pwd) # this script's directory: the helpers live beside it
+mkdir -p "$(dirname "$file")"
+# Create only when missing: Herdra's widget watches this directory and reruns
+# herdra-check (which lists open items) on every change, so a touch on each
+# read would loop.
+[[ -e "$file" ]] || : >"$file"
+
+fail() { echo "herdra-open: $*" >&2; exit 1; }
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Every item in the log, open or closed, with its section and its log lines as `history`.
+# An update or close of an unknown or already closed id is ignored.
+fold='
+def section:
+  if .closed then "done"
+  elif .pending == true then "pending"
+  elif .parked == true or ((.on // "") | ascii_downcase) == "herdra" then "next"
+  elif ((.on // "") | ascii_downcase) == "algorant" then "you"
+  else "progress" end;
+def live($id): has($id) and (.[$id].closed | not);
+reduce .[] as $e ({};
+  if $e.op == "open" then .[$e.id] = ($e + {history: [$e]})
+  elif $e.op == "update" then (if live($e.id) then .[$e.id] |= (. + ($e | del(.op, .at)) + {updated: $e.at, history: (.history + [$e])}) else . end)
+  elif $e.op == "close" then (if live($e.id) then .[$e.id] |= (. + {closed: {at: $e.at, note: ($e.note // "")}, history: (.history + [$e])}) else . end)
+  else . end)
+| [.[] | . + {section: section}]'
+# Open items, lowest rank first (unranked last), then oldest first.
+by_rank='map(select(.closed | not)) | sort_by([(.rank // 1e9), .at])'
+
+# The inbox log: replies to a thread land here, on this machine.
+inbox_log="${XDG_STATE_HOME:-$HOME/.local/state}/pi-agency/inbox/log.jsonl"
+
+# The derived answer (task-121), applied inside the fold's own jq so no read gains a second reader
+# process: an empty `replies` leaves every item exactly as the record has it. An item in progress, on an
+# owner, with a thread link whose thread got a non-Herdra result or blocked reply after the item's last
+# change (and after the inbox log's last write) is shown in Needs you as kind Read, with the reply's
+# headline as `answer`; its old `rec` and `options` are dropped, because the question they answer is
+# already answered.
+derive='
+def epoch: (try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0);
+def replies: [$replylines | split("\n")[] | select(length > 0) | (try fromjson catch null)
+  | select(. != null and (.op == "send" or .op == "deliver")) | .env // empty
+  | select((.reply_to // "") != "" and (.kind == "result" or .kind == "blocked")
+           and (((.from.label // "") | ascii_downcase) != "herdra") and ((.at // "") != ""))
+  | {reply_to, at, kind, id, headline: (.headline // ((.body // "") | split("\n")[0])), by: (.from.label // .from.terminal // "")}];
+def derived:
+  if $replylines == "" then .
+  else replies as $replies | map(
+    . as $it
+    | (($it.updated // $it.at) | epoch) as $last
+    | [$it.links[]? | select(.kind == "thread") | .target] as $threads
+    | if $it.section == "progress" and ($threads | length) > 0 then
+        ([$replies[] | select(.reply_to as $r | $threads | index($r)) | select((.at | epoch) >= $last)]
+          | sort_by(.at | epoch) | last) as $reply
+        | if $reply == null then $it else
+            $it + {on: "algorant", section: "you", kind: "Read", answer: $reply.headline,
+                   answered: {message: $reply.id, at: $reply.at, kind: $reply.kind, by: $reply.by},
+                   waiting: "Algorant reads the answer",
+                   ask: "**Asked:** \($it.what)\n\n**Answer:** \($reply.headline)\n\n\($reply.by) answered \($reply.id); not delivered yet"}
+            | del(.rec, .options)
+          end
+      else $it end)
+  end;'
+# The replies an open item could be answered by, piped to the fold's `jq` as its stdin: nothing at all
+# while the record has no thread link, else one `grep` of the inbox log for its result/blocked replies.
+# Their lines are parsed inside that same `jq`, so there is no extra process and no second pass over the
+# record; only open In progress items with a thread link use them. An unreadable log is reported and
+# skipped, never fatal: this only displays, so a broken inbox must not break the footer, the widget, the
+# window or herdra-check.
+replies_in() {
+  grep -q '"kind":"thread"' "$file" 2>/dev/null || return 0
+  [[ -e $inbox_log ]] || return 0
+  [[ -r $inbox_log ]] || { echo "herdra-open: cannot read the inbox log $inbox_log: showing the list without the answered rows" >&2; return 0; }
+  grep -E '"kind":"(result|blocked)","reply_to":"m[0-9a-f]{8}"' "$inbox_log" || true
+}
+
+open_items() { replies_in | jq -s --rawfile replylines /dev/stdin "$derive $fold | $by_rank | derived" "$file"; }
+
+# Open items, then items closed within $1 seconds (newest first).
+items_json() {
+  replies_in | jq -s --argjson secs "$1" --argjson now "$(date +%s)" --rawfile replylines /dev/stdin "$derive $fold
+    | ($by_rank) + (map(select(.closed and \$secs > 0 and (\$now - (.closed.at | fromdateiso8601)) <= \$secs)) | sort_by(.closed.at) | reverse)
+    | derived" "$file"
+}
+# Optional fields, shared by add and update. `optional FLAG VALUE…` sets `eat` to the arguments it
+# took (0: not an optional field); `extra` collects the fields, `options` and `links` the lists, and
+# `words`, `rec` and `kind` keep the last value each was given so a command can judge them without a
+# process of its own.
+extra='{}'; options=(); links=(); words= rec= kind=; eat=0
+optional() {
+  eat=2
+  case "$1" in
+    --ask|--rec|--option|--link|--kind|--rank) [[ $# -ge 2 ]] || fail "$1 needs a value" ;;
+  esac
+  case "$1" in
+    --ask) words=$2; extra=$(jq -c --arg v "$2" '. + {words: $v, ask: $v}' <<<"$extra") ;;
+    --rec) rec=$2; extra=$(jq -c --arg v "$2" '. + {rec: $v}' <<<"$extra") ;;
+    --option) options+=("$2") ;;
+    --link) [[ "$2" =~ ^(task|post|agent|thread|file)=.+$ ]] || fail "--link wants task|post|agent|thread|file=target, got: $2"
+            links+=("$2") ;;
+    --kind) [[ "$2" =~ ^(Decide|Approve|Check|Read)$ ]] || fail "--kind is Decide, Approve, Check or Read, got: $2"
+            kind=$2
+            extra=$(jq -c --arg v "$2" '. + {kind: $v}' <<<"$extra") ;;
+    --rank) [[ "$2" =~ ^[0-9]+$ ]] || fail "--rank is an integer, got: $2"
+            extra=$(jq -c --arg v "$2" '. + {rank: ($v | tonumber)}' <<<"$extra") ;;
+    *) eat=0 ;;
+  esac
+}
+# Fold the collected lists into `extra`.
+extra_done() {
+  if ((${#options[@]})); then
+    extra=$(jq -c --argjson o "$(jq -nc '$ARGS.positional' --args "${options[@]}")" '. + {options: $o}' <<<"$extra")
+  fi
+  if ((${#links[@]})); then
+    extra=$(jq -c --argjson l "$(jq -nc '$ARGS.positional | map(capture("^(?<kind>[a-z]+)=(?<target>.+)$"))' --args "${links[@]}")" '. + {links: $l}' <<<"$extra")
+  fi
+}
+
+# Close open item $1, replaced by the item $2 just written: its note names the new item, and each of
+# its thread requests still open in the inbox (and not a thread of $2) is closed as superseded.
+supersede() {
+  local old new threads open m
+  old=$(open_item "$1"); new=$(open_item "$2")
+  jq -nc --arg id "$1" --arg at "$(now)" --arg note "Superseded by $2: $(jq -r .what <<<"$new")" '{op: "close", id: $id, at: $at, note: $note}' >>"$file"
+  open=$("$HOME/.pi/agent/scripts/inbox" open --json)
+  threads=$(jq -r --argjson new "$new" '[.links[]? | select(.kind == "thread") | .target] - [$new.links[]? | select(.kind == "thread") | .target] | .[]' <<<"$old")
+  for m in $threads; do
+    jq -e --arg m "$m" 'any(.id == $m)' <<<"$open" >/dev/null || continue
+    "$HOME/.pi/agent/scripts/inbox" close "$m" "superseded by herdra-open $2$(jq -r '[.links[]? | select(.kind == "thread") | " (\(.target))"][0] // ""' <<<"$new")" >/dev/null
+    echo "closed superseded request $m"
+  done
+  echo "closed $1 (superseded by $2)"
+}
+
+next_id() { echo "o$(($(jq -s '[.[] | select(.op == "open") | .id | ltrimstr("o") | tonumber] | max // 0' "$file") + 1))"; }
+
+# The open item $1 as JSON, or fail.
+open_item() {
+  local item
+  item=$(open_items | jq -c --arg id "$1" '.[] | select(.id == $id)')
+  [[ -n "$item" ]] || fail "no open item $1"
+  echo "$item"
+}
+# An open item on the same project that already covers what `add` just wrote: say so on stderr and name
+# both exits, instead of letting a second row drift beside the first (task-139). The judgement is
+# bin/lib/match.ts's, the same one the turn-end check uses. One record read and one short bun process,
+# only on a write and only while that project has an open item; nothing is closed or changed on the guess.
+supersede_hint() {
+  local project=$1 what=$2 items
+  # A cheap filter first: a project this record has never named costs one grep, not a read. It runs
+  # before the new row is written, so the record holds only the rows this one might replace.
+  grep -q -- "\"project\":\"$project\"" "$file" 2>/dev/null || return 0
+  # Open items only, without the derived answers or the idle marks a reader needs: this judges lines.
+  items=$(jq -s "$fold | $by_rank" "$file") || return 0
+  jq -e --arg p "$project" '[.[] | select((.project // "") | ascii_downcase == ($p | ascii_downcase))] | length > 0' <<<"$items" >/dev/null 2>&1 || return 0
+  bun run - "$project" "$what" "$items" "$bindir/lib/match.ts" <<'TS' || return 0
+const [project, what, itemsJson, matchPath] = process.argv.slice(2);
+const { duplicatesOf } = await import(matchPath);
+const items = JSON.parse(itemsJson);
+const others = items.filter((item: any) => String(item.project ?? "").toLowerCase() === project.toLowerCase());
+const near = duplicatesOf({ what, project }, others);
+for (const row of near.slice(0, 2)) {
+  const line = String(row.what).split("\n")[0];
+  // An ask item has one exit only: withdrawn, with his reason (herdra-open refuses `close` alone).
+  const out = row.asked ? `close ${row.id} --drop "<why it was withdrawn>"` : `close ${row.id} "<what ended it>"`;
+  console.error(`herdra-open: hint: ${row.id} may already cover this (“${line}”) — re-run with --supersedes ${row.id} to replace it in one step, or ${out} if the work moved on`);
+}
+TS
+}
+
+# Fail when open item $2 is an ask item: its only exits are deliver, seen and close --drop.
+refuse_ask() {
+  jq -e '.asked == true' <<<"$2" >/dev/null || return 0
+  fail "$1 is an ask item: it is closed only once Algorant has seen the answer. herdra-open deliver $1 --link post=<url>|file=<path> \"<answer>\", then herdra-open seen $1; if he withdrew the ask: herdra-open close $1 --drop \"reason\""
+}
+
+cmd="${1:-list}"; shift || true
+case "$cmd" in
+  add)
+    project= on= waiting= closes= pending= supersedes=
+    while [[ $# -gt 1 ]]; do
+      case "$1" in
+        --project) project="$2"; shift 2 ;;
+        --supersedes) supersedes="$2"; open_item "$2" >/dev/null; shift 2 ;;
+        --on) on="$2"; shift 2 ;;
+        --pending) pending=1; shift ;;
+        --waiting) waiting="$2"; shift 2 ;;
+        --closes) closes="$2"; shift 2 ;;
+        *) optional "$@"; ((eat)) || break; shift "$eat" ;;
+      esac
+    done
+    [[ $# -eq 1 && -n "$1" && -n "$project" && -n "$on" && -n "$waiting" && -n "$closes" ]] \
+      || fail 'usage: add --project P --on O --waiting W --closes C [--pending] [--ask A] [--option O]… [--rec R] [--link K=T]… [--kind K] [--rank N] "what is open"'
+    extra_done
+    # A row that waits on Algorant carries what he is deciding: the row line is the move, --ask is the
+    # question, and a Decide row carries its options and Herdra's recommendation (task-139).
+    if [[ "${on,,}" == algorant && -z $pending && -z $words ]]; then
+      fail 'add: a Needs-you item needs --ask "<what he is deciding>": the row says the move, --ask says the question'
+    fi
+    if [[ "$kind" == Decide ]]; then
+      (( ${#options[@]} )) || fail 'add: a Decide item needs --option "Title — detail" (at least one, repeatable)'
+      [[ -n $rec ]] || fail 'add: a Decide item needs --rec "A. …": the recommendation, starting with the option letter'
+    fi
+    id=$(next_id)
+    [[ -n "$supersedes" ]] || supersede_hint "$project" "$1"
+    jq -nc --arg id "$id" --arg at "$(now)" --arg p "$project" --arg on "$on" --arg w "$waiting" --arg c "$closes" --arg pending "$pending" --arg what "$1" --argjson extra "$extra" \
+      '{op: "open", id: $id, at: $at, project: $p, what: $what, on: $on, waiting: $w, closes: $c} + (if $pending == "" then {} else {pending: true} end) + $extra' >>"$file"
+    echo "$id"
+    [[ -z "$supersedes" ]] || supersede "$supersedes" "$id"
+    ;;
+  ask)
+    project= on= thread= supersedes=
+    [[ $# -ge 1 && "$1" != --* ]] || fail 'usage: ask "<short line: the move>" --ask "<his words, verbatim>" --project P --on OWNER --thread MSG [--link K=T]… [--rank N]'
+    what="$1"; shift
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --project) project="$2"; shift 2 ;;
+        --on) on="$2"; shift 2 ;;
+        --thread) [[ $# -ge 2 && "$2" =~ ^m[0-9a-f]{8}$ ]] || fail "--thread wants an inbox message id (m…), got: ${2:-}"
+                  thread="$2"; shift 2 ;;
+        --supersedes) [[ $# -ge 2 ]] || fail "--supersedes needs an item id"; supersedes="$2"; open_item "$2" >/dev/null; shift 2 ;;
+        --ask|--link|--rank) optional "$@"; shift "$eat" ;;
+        *) fail "ask: unknown argument $1" ;;
+      esac
+    done
+    [[ -n "$what" && -n "$project" && -n "$on" && -n "$thread" ]] \
+      || fail 'usage: ask "<short line: the move>" --ask "<his words, verbatim>" --project P --on OWNER --thread MSG [--link K=T]… [--rank N]'
+    jq -e '(.words // "") != ""' <<<"$extra" >/dev/null \
+      || fail 'ask needs --ask "<his words, verbatim>": the row says the move, his words are the context'
+    [[ "${on,,}" != algorant && "${on,,}" != herdra ]] || fail "--on is the agent that owes the answer, not $on"
+    links=("thread=$thread" "${links[@]}")
+    extra_done
+    id=$(next_id)
+    [[ -n "$supersedes" ]] || supersede_hint "$project" "$what"
+    jq -nc --arg id "$id" --arg at "$(now)" --arg p "$project" --arg on "$on" --arg what "$what" --argjson extra "$extra" \
+      '{op: "open", id: $id, at: $at, project: $p, what: $what, on: $on, waiting: "the owner answers the question", closes: "Algorant has seen the answer"} + $extra + {asked: true}' >>"$file"
+    echo "$id"
+    [[ -z "$supersedes" ]] || supersede "$supersedes" "$id"
+    ;;
+  deliver)
+    [[ $# -ge 1 ]] || fail 'usage: deliver ID --link post=URL|file=PATH [--link K=T]… "<one-line answer>"'
+    id="$1"; shift
+    item=$(open_item "$id")
+    jq -e '.asked == true' <<<"$item" >/dev/null || fail "$id is not an ask item (herdra-open ask)"
+    answer=
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --link) optional "$@"; shift "$eat" ;;
+        --*) fail "deliver takes --link and the answer, got: $1" ;;
+        *) [[ -z "$answer" ]] || fail "deliver takes one answer, got a second: $1"; answer="$1"; shift ;;
+      esac
+    done
+    [[ -n "$answer" ]] || fail 'deliver needs the one-line answer'
+    printf '%s\n' "${links[@]:-}" | grep -Eq '^(post|file)=' || fail "deliver needs --link post=<url> or --link file=<path>: an answer Algorant cannot open is not delivered"
+    jq -e '(.words // "") != ""' <<<"$item" >/dev/null \
+      || fail "$id has no words to show as the ask: record them first with herdra-open update $id --ask \"<his words, verbatim>\""
+    extra_done
+    newlinks=$(jq -c '.links // []' <<<"$extra")
+    patch=$(jq -nc --argjson item "$item" --argjson nl "$newlinks" --arg a "$answer" --arg at "$(now)" '
+      {on: "algorant", kind: "Read", delivered: $at, answer: $a, waiting: "Algorant reads the answer",
+       rec: null, options: null,
+       ask: "**Asked:** \($item.words)\n\n**Answer:** \($a)",
+       links: (($item.links // []) as $old | $old + ($nl | map(select(. as $l | $old | any(.kind == $l.kind and .target == $l.target) | not))))}')
+    jq -c --arg id "$id" --arg at "$(now)" '{op: "update", id: $id, at: $at} + .' <<<"$patch" >>"$file"
+    echo "delivered $id (Needs you, Read)"
+    ;;
+  seen)
+    [[ $# -eq 1 ]] || fail 'usage: seen ID'
+    item=$(open_item "$1")
+    jq -e '.asked == true' <<<"$item" >/dev/null || fail "$1 is not an ask item (use close)"
+    jq -e '.delivered // empty' <<<"$item" >/dev/null || fail "$1 has not been delivered: herdra-open deliver $1 --link post=<url>|file=<path> \"<answer>\" first"
+    jq -nc --arg id "$1" --arg at "$(now)" --argjson item "$item" '{op: "close", id: $id, at: $at, note: $item.answer}' >>"$file"
+    echo "closed $1 (seen)"
+    ;;
+  update)
+    [[ $# -ge 1 ]] || fail 'usage: update ID [--on O] [--waiting W] [--closes C] [--parked|--unparked] [--pending|--unpending] [--ask A] [--option O]… [--rec R] [--link K=T]… [--kind K] [--rank N] ["what is open"]'
+    id="$1"; shift
+    item=$(open_items | jq -c --arg id "$id" '.[] | select(.id == $id)')
+    [[ -n "$item" ]] || fail "no open item $id"
+    patch='{}'
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --on) patch=$(jq -c --arg v "$2" '. + {on: $v}' <<<"$patch"); shift 2 ;;
+        --waiting) patch=$(jq -c --arg v "$2" '. + {waiting: $v}' <<<"$patch"); shift 2 ;;
+        --closes) patch=$(jq -c --arg v "$2" '. + {closes: $v}' <<<"$patch"); shift 2 ;;
+        --parked) patch=$(jq -c '. + {parked: true}' <<<"$patch"); shift ;;
+        --unparked) patch=$(jq -c '. + {parked: false}' <<<"$patch"); shift ;;
+        --pending) patch=$(jq -c '. + {pending: true}' <<<"$patch"); shift ;;
+        --unpending) patch=$(jq -c '. + {pending: false}' <<<"$patch"); shift ;;
+        *) optional "$@"
+           if ((eat)); then shift "$eat"; else patch=$(jq -c --arg v "$1" '. + {what: $v}' <<<"$patch"); shift; fi ;;
+      esac
+    done
+    extra_done
+    # --ask is his words: `words` always, and the detail view's `ask` only until an answer is delivered.
+    if jq -e '.delivered // empty' <<<"$item" >/dev/null; then extra=$(jq -c 'del(.ask)' <<<"$extra"); fi
+    patch=$(jq -c --argjson e "$extra" '. + $e' <<<"$patch")
+    [[ "$patch" != '{}' ]] || fail "nothing to update for $id"
+    jq -c --arg id "$id" --arg at "$(now)" '{op: "update", id: $id, at: $at} + .' <<<"$patch" >>"$file"
+    echo "updated $id"
+    ;;
+  close)
+    [[ $# -ge 1 ]] || fail 'usage: close ID ["what closed it"]  (ask items: close ID --drop "reason")'
+    item=$(open_item "$1")
+    note="${2:-}"
+    if [[ "${2:-}" == --drop ]]; then
+      jq -e '.asked == true' <<<"$item" >/dev/null || fail "--drop is for ask items; $1 is not one"
+      [[ -n "${3:-}" ]] || fail 'usage: close ID --drop "why the ask was withdrawn"'
+      note="Withdrawn: $3"
+    else
+      refuse_ask "$1" "$item"
+    fi
+    jq -nc --arg id "$1" --arg at "$(now)" --arg note "$note" '{op: "close", id: $id, at: $at, note: $note}' >>"$file"
+    echo "closed $1"
+    ;;
+  answer)
+    [[ $# -eq 2 && -n "$2" ]] || fail 'usage: answer ID "Algorant'"'"'s answer"'
+    id="$1" answer="$2"
+    item=$(open_items | jq -c --arg id "$id" '.[] | select(.id == $id)')
+    [[ -n "$item" ]] || fail "no open item $id"
+    refuse_ask "$id" "$item"
+    thread=$(jq -r '[.links[]? | select(.kind == "thread") | .target][0] // empty' <<<"$item")
+    [[ -n "$thread" ]] || fail "$id has no thread link (--link thread=<message id>), so there is no request to answer"
+    task=$(jq -r '[.links[]? | select(.kind == "task") | .target][0] // empty' <<<"$item")
+    what=$(jq -r .what <<<"$item")
+    here=$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)
+    own_task=
+    if [[ "$task" =~ ^([^:]+):(task-[0-9-]+)$ && "${BASH_REMATCH[1],,}" == herdra ]]; then own_task=${BASH_REMATCH[2]}; fi
+    body="Algorant's answer: $answer
+
+Re: $what"
+    [[ -z "$task" || -n "$own_task" ]] || body+="
+Record this answer in $task."
+    # One inbox `result` with reply_to the thread, to the other party of that message (its sender, or its
+    # recipient when this terminal sent it), on the same send path as `agent_send` and `inbox result`.
+    # Replying closes the request. That party is found by its core id in hc machine ls (an inbox machine
+    # label such as homelab-server is not an hc machine name). When its terminal is gone, the answer goes to the
+    # item's --on agent, else the item project's Ceph; when that is this terminal (Herdra's own project),
+    # nothing is sent and the thread is closed with the answer as its note.
+    # Prints "<new message id> <route>", or "- <why>" when nothing was sent.
+    sent=$(bun run - "$thread" "$body" "$item" "$answer" <<'TS'
+import { homedir } from "node:os";
+import { join } from "node:path";
+const pi = join(homedir(), ".pi/agent");
+const { hcAddress } = await import(join(pi, "scripts/whois.ts"));
+const { hcFind, hcJson, hcMachines } = await import(join(pi, "extensions/pi-herdr/core.ts"));
+const { dropHcEnvelope } = await import(join(pi, "extensions/pi-agency/inbox/send.ts"));
+const { appendEvent, closeMessage, headlineOf, localActor, localMachine, messages, newId, readEvents } = await import(join(pi, "extensions/pi-agency/inbox/envelope.ts"));
+const fail = (m: string): never => { console.error(`herdra-open: ${m}`); process.exit(1); };
+const [id, body, itemJson, answer] = process.argv.slice(2);
+const item = JSON.parse(itemJson);
+if (!process.env.HC_TERMINAL_ID) fail("answer needs a native hc terminal (HC_TERMINAL_ID)");
+const message = messages(readEvents()).get(id) ?? fail(`no message ${id} in this machine's inbox log`);
+const local = localMachine();
+const own = await hcAddress(process.env.HC_TERMINAL_ID!);
+const other = message.from.core === own.core && message.from.terminal === own.terminal ? message.to : message.from;
+if (!other?.terminal || !other.core) fail(`${id} has no hc terminal on the other side`);
+const machines = await hcMachines();
+const prefix = (core: string) => {
+  if (core === own.core) return "";
+  const m = machines.find((entry) => entry.id === core) ?? fail(`no machine in hc machine ls has core ${core} (${other.label || other.terminal}@${other.machine})`);
+  return `${m.name}/`;
+};
+// The hc address, never the whois label (a label like "algOS Ceph" is not an hc name).
+let route = `${prefix(other.core)}${other.terminal}`;
+let via = "";
+if ((await hcFind(route))?.state !== "live") {
+  // The sender is gone (a manus that closed its tab): its owner gets the answer.
+  const [name = "", at] = String(item.on ?? "").split("@");
+  const agent = ["", "algorant", "herdra"].includes(name.toLowerCase()) ? "" : name;
+  const live = (await hcJson(["ls", "--json"])).terminals.filter((t: any) => t.state === "live");
+  const ceph = (project: string) => live.find((t: any) => t.agent === "pi" && (t.where ?? "").toLowerCase() === `${project.toLowerCase()} / main`);
+  const owner = (agent && (at ? live.find((t: any) => t.address === `${at}/${agent}`) : live.find((t: any) => t.address === agent || t.name === agent)))
+    || (agent && ceph(agent)) || (item.project && ceph(item.project));
+  if (!owner) fail(`${route} is gone and neither ${item.on} nor project ${item.project} has a live owner to take the answer`);
+  via = ` (${route} is gone)`;
+  route = owner.address;
+  if (route === own.terminal) {
+    closeMessage(id, `answered (${other.label || other.terminal} is gone): ${answer}`, await localActor());
+    console.log(`- ${other.label || other.terminal} is gone and the owner is this terminal; closed ${id} with the answer`);
+    process.exit(0);
+  }
+}
+const env = { v: 1, id: newId(), at: new Date().toISOString(), kind: "result", reply_to: id,
+  from: { machine: local, ...own }, to: { machine: local, terminal: route, core: "", label: "" }, headline: headlineOf(body), body };
+try { await dropHcEnvelope(env, route); } catch (error) { fail(`not sent to ${route}: ${error instanceof Error ? error.message : error}`); }
+appendEvent({ op: "send", env });
+console.log(`${env.id} ${route}${via}`);
+TS
+) || fail "reply not sent; $id is still open"
+    jq -nc --arg id "$id" --arg at "$(now)" --arg note "$answer" '{op: "close", id: $id, at: $at, note: $note}' >>"$file"
+    if [[ "$sent" == "- "* ]]; then echo "${sent#- }; closed $id"; else echo "sent ${sent%% *} to ${sent#* } (reply to $thread); closed $id"; fi
+    if [[ -n "$own_task" ]]; then
+      cur=$(cd "$here" && tandem --json show "$own_task" | jq -r .data.body) || fail "Task note not added: cannot read $own_task"
+      (cd "$here" && tandem update "$own_task" --body "$cur
+- $(date +%F) Algorant's answer (herdra-open $id, $([[ "$sent" == "- "* ]] && echo "thread $thread closed" || echo "reply ${sent%% *}")): $answer" >/dev/null) || fail "Task note not added to $own_task"
+      echo "noted in $own_task"
+    fi
+    ;;
+  list)
+    json= closed=0
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --json) json=1; shift ;;
+        --closed) [[ $# -ge 2 && "$2" =~ ^([0-9]+)([hd])$ ]] || fail '--closed wants Nh or Nd, e.g. 24h'
+                  closed=$((BASH_REMATCH[1] * 3600)); [[ "${BASH_REMATCH[2]}" == h ]] || closed=$((closed * 24)); shift 2 ;;
+        *) fail "unknown list option $1" ;;
+      esac
+    done
+    if [[ -n "$json" ]]; then
+      items_json "$closed" | "$bindir/herdra-silent"
+    else
+      ((closed == 0)) || fail '--closed needs --json'
+      open_items | "$bindir/herdra-silent" | jq -r '.[] | "\(.id)  [\(.project)] \(.what)  · on: \(.on // "-")\(if .silent then " (\(.silent.mark))" else "" end) · waiting: \(.waiting) · closes: \(.closes)\(if .pending then " · pending" else "" end)\(if .parked then " · parked" else "" end)"'
+    fi
+    ;;
+  footer)
+    # Herdra's reply footer: the same items the window shows, Pending (time-gated items, then the Tasks
+    # tagged needs-<host>, one line per host) last. A board herdra-online cannot read is named on stderr.
+    # Owners print as `whois` labels (the one resolver); an `on` that names no terminal (a project) prints as written.
+    items=$(open_items | "$bindir/herdra-silent")
+    ons=()
+    while IFS= read -r o; do ons+=("$o"); done < <(jq -r '[.[] | select(.section == "progress") | .on] | unique | .[]' <<<"$items")
+    who='{}'
+    if ((${#ons[@]})); then
+      out=$("$HOME/.pi/agent/scripts/whois" --json "${ons[@]}") || [[ -n "$out" ]] || fail "whois failed for: ${ons[*]}"
+      who=$(jq -cn --argjson ids "$(printf '%s\n' "${ons[@]}" | jq -R . | jq -sc .)" --argjson out "$out" \
+        '[range($ids | length) as $i | select($out[$i].error | not) | {key: $ids[$i], value: $out[$i].label}] | from_entries')
+    fi
+    gated=$("$bindir/herdra-online" --list --json) || [[ -n "$gated" ]] || fail "herdra-online --list failed"
+    # An In progress owner whose terminal is a plain shell (its Pi died) is marked down, one with no live
+    # terminal at all gone, as herdra-check resolves owners (a project names its main tab on any machine);
+    # one idle or done while it still owes the item adds herdra-silent's mark.
+    jq -r --argjson who "$who" --argjson gated "$gated" --argjson ls "$(hc ls --json)" '
+      def of($s): map(select(.section == $s));
+      def mark: (split("@") | [.[0], (.[1] // "")]) as [$o, $m]
+        | [$ls.terminals[] | select(.state == "live")
+            | (.address | if contains("/") then split("/")[0] else "" end) as $tm
+            | select(.address == (if $m == "" then $o else "\($m)/\($o)" end)
+                or ($tm == $m and .name == $o)
+                or (($m == "" or $tm == $m) and ((.where // "") | ascii_downcase) == "\($o | ascii_downcase) / main"))]
+        | if length == 0 then " (gone: no live terminal)" elif all(.agent | IN("zsh", "bash", "fish", "sh", "nu", "pwsh")) then " (down: no Pi running)" else "" end;
+      def block($title; $xs): if ($xs | length) == 0 then empty else "**\($title):**\n\n\($xs | join("\n"))\n" end;
+      def stat: (.on | mark) + (if .silent then " (\(.silent.mark))" else "" end);
+      # What the row needs from him, on the line itself (task-139): the recommendation, else the first
+      # line of his ask, without markdown or the record\u0027s own Asked: label, clipped.
+      def firstline($t): ($t // "") | split("\n")
+        | map(gsub("\\*\\*|`"; "") | gsub("^(Asked|Answer|Question)\\s*:\\s*"; "") | gsub("^\\s+|\\s+$"; ""))
+        | map(select(length > 0)) | (.[0] // "");
+      def clip($t): if length > 100 then .[0:99] + "…" else . end;
+      def gist: (if (.rec // "") != "" then firstline(.rec) else firstline(.ask) end);
+      def note:
+        (if (.answer // "") != "" then "answered: \(firstline(.answer))" else gist end) | clip(0);
+      block("Needs you"; of("you") | map("- \(.what)" + (if (note) != "" then " — \(note)" else "" end) + (if .kind == "Read" then ([.links[]? | select(.kind == "post" or .kind == "file") | " — \(.target)"] | join("")) else "" end))),
+      block("In progress"; of("progress") | map("- \(.what): \($who[.on] // .on)\(stat)")),
+      (of("next") as $n | block("Up next"; [$n[:5] | to_entries[] | "\(.key + 1). \(.value.what)"] + (if ($n | length) > 5 then ["\nand \($n | length - 5) more"] else [] end))),
+      block("Pending"; (of("pending") | map("- \(.what)"))
+        + [$gated | group_by(.host)[] | "- needs \(.[0].host)\(if .[0].connected then " (online, owners told)" else "" end): \([group_by(.project)[] | "\(.[0].project) \([.[].id] | join(", "))"] | join("; "))"])' <<<"$items"
+    ;;
+  *) fail "unknown command $cmd (add, ask, deliver, seen, update, close, answer, list, footer)" ;;
+esac

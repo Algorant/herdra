@@ -1,0 +1,64 @@
+// Herdr Needs-you cards in Hokum (task-79, option B, picked by Algorant 2026-11-06).
+// The alerts mod sends app "<Kind> · <Project>" (or "Done · <Project>"), a short title, and the
+// recommendation as the body. These rules turn that into: a stripe in the kind's colour, a small ram
+// icon, a "KIND · PROJECT" label, the title, and the recommendation in a tinted RECOMMENDED box.
+// Hokum 0.1.3 KDL; `template` and `rule` work in config.kdl and in a theme (docs/themes.md).
+// Install: see RECIPE.md ("Hokum card rules"). Undo: delete this whole block.
+//
+// Colours are Verdigris literals: goldenrod (Decide), teal-light (Approve), ink-violet (Check),
+// vellum-grey (Read / no kind: an FYI), moss-green accent of the theme (Done).
+
+template "need" {
+    row gap=8 align="center" {
+        icon size=16
+        text "{app|upper}" size=11 weight=700 tracking=0.8 color="accent" lines=1 grow=#true
+        text "{time}" size=11 color="faint"
+        close
+    }
+    text "{summary}" weight="title" lines=2
+    if "body" {
+        row gap=8 padding-x=10 padding-y=7 radius=8 fill="accent/14" {
+            text "RECOMMENDED" size=10 weight=700 tracking=0.6 color="accent"
+            text "{body}" lines=2 grow=#true
+        }
+    }
+    actions
+}
+
+template "done" {
+    row gap=8 align="center" {
+        icon size=16
+        text "{app|upper}" size=11 weight=700 tracking=0.8 color="accent" lines=1 grow=#true
+        text "{time}" size=11 color="faint"
+        close
+    }
+    text "{summary}" weight="title" lines=2
+    if "body" { text "{body}" color="muted" lines=2 }
+    actions
+}
+
+rule app="Decide ·*" {
+    template "need"
+    tokens { mark "stripe"; accent "#b8863b" }
+}
+rule app="Approve ·*" {
+    template "need"
+    tokens { mark "stripe"; accent "#5aa0a3" }
+}
+rule app="Check ·*" {
+    template "need"
+    tokens { mark "stripe"; accent "#8989b0" }
+}
+rule app="Read ·*" {
+    template "need"
+    tokens { mark "stripe"; accent "#a89984" }
+}
+// An item with no kind.
+rule app="Needs you ·*" {
+    template "need"
+    tokens { mark "stripe"; accent "#a89984" }
+}
+rule app="Done ·*" {
+    template "done"
+    tokens { mark "stripe"; accent "#8ec07c" }
+}

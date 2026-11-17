@@ -1,0 +1,8 @@
+#!/bin/sh
+# Click on an alert card: raise the Herdr window, then focus the agent's terminal ($1: its address,
+# or an hc name such as herdra, which hc resolves to its address now).
+# Hokum runs this directly (omarchy-exec-argv / omarchy-actions), without the login shell's PATH.
+PATH="$HOME/.local/bin:$PATH"
+address=$(hc get "$1" --json | jq -er .address) || exit 1
+hyprctl dispatch 'hl.dsp.focus({ window = "class:herdr-app" })'
+exec herdr-app do agent.focus --terminal "$address"

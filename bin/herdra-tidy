@@ -1,0 +1,1372 @@
+#!/usr/bin/env python3
+"""One-shot, read-only inventory of local Pi and temporary-resource cleanup candidates."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = 1
+HEAVY_PSS = 350 * 1024
+HEAVY_SESSION = 25 * 1024 * 1024
+HEAVY_ENTRIES = 10_000
+OLD_DAYS, OLD_BYTES = 14, 10 * 1024 * 1024
+QUIET_HOURS = 24
+TMP_STALE_HOURS = 24
+AUX_OLD_HOURS = 24
+KNOWN_HC_TEST_ROOTS = {"hc-test-herdra-footer-task612", "herdra-liveshot", "herdra-open-widget",
+                      "herdra-verify-a-positive", "pi-ask-me-hc-test", "pi-reload-674", "t580"}
+RETAINED_SHELL_PROOF_VERIFIED = True  # recorded disposable/no-child proof: research/task-142.md
+
+started = time.monotonic()
+cpu_started = time.process_time()
+launches = 0
+
+
+def fail(message: str) -> "NoReturn":
+    print(f"herdra-tidy: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run(argv: list[str], timeout=None) -> tuple[int, str, str]:
+    global launches
+    launches += 1
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout}s"
+    except OSError as exc:
+        return 127, "", str(exc)
+    return p.returncode, p.stdout, p.stderr.strip()
+
+
+def parse_json(out: str, context: str):
+    try:
+        return json.loads(out)
+    except (TypeError, json.JSONDecodeError) as exc:
+        fail(f"invalid JSON from {context}: {exc}")
+
+
+def proc_stat(pid: int):
+    """Read kernel identity and parent/group/start time; comm may contain spaces."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        end = raw.rfind(")")
+        fields = raw[end + 2:].split()
+        return {"state": fields[0], "ppid": int(fields[1]), "pgrp": int(fields[2]),
+                "start": int(fields[19])}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def proc_status(pid: int):
+    try:
+        values = {}
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith(("VmRSS:", "Name:")):
+                key, *rest = line.split()
+                values[key.rstrip(":")] = rest
+        rss = int(values["VmRSS"][0]) if "VmRSS" in values else None
+        return rss, " ".join(values.get("Name", [])) or None
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
+def proc_pss(pid: int):
+    try:
+        for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def proc_cmdline(pid: int, limit=8192):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as stream:
+            raw = stream.read(limit + 1)
+        if len(raw) > limit or (raw and not raw.endswith(b"\0")):
+            return []
+        return [x.decode(errors="replace") for x in raw.split(b"\0") if x]
+    except OSError:
+        return []
+
+
+def proc_command_prefix(pid, limit=16 * 1024, max_args=8):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as stream:
+            raw = stream.read(limit + 1)
+        raw = raw[:limit]
+        result = []
+        for token in raw.split(b"\0"):
+            if not token:
+                continue
+            if token == b"--":
+                break
+            result.append(token.decode(errors="replace"))
+            if len(result) >= max_args:
+                break
+        return result
+    except OSError:
+        return []
+
+
+def proc_exe(pid: int):
+    try:
+        name = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+        suffix = " (deleted)"
+        return name[:-len(suffix)] if name.endswith(suffix) else name
+    except OSError:
+        return None
+
+
+def process_table():
+    table = {}
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return table
+    with entries:
+        for ent in entries:
+            if ent.name.isdigit():
+                pid = int(ent.name)
+                stat = proc_stat(pid)
+                if stat:
+                    table[pid] = stat
+    return table
+
+
+def descendants(table, root):
+    children = {}
+    for pid, row in table.items():
+        children.setdefault(row["ppid"], []).append(pid)
+    found, stack = set(), list(children.get(root, []))
+    while stack:
+        pid = stack.pop()
+        if pid not in found:
+            found.add(pid)
+            stack.extend(children.get(pid, []))
+    return found
+
+
+def process_start_epoch(stat):
+    # Linux start ticks are relative to boot. /proc/uptime gives boot-relative elapsed time.
+    try:
+        ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        uptime = float(Path("/proc/uptime").read_text().split()[0])
+        return time.time() - uptime + stat["start"] / ticks
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+def memory(pid):
+    rss, _ = proc_status(pid)
+    pss = proc_pss(pid)
+    return rss, pss
+
+
+def stamp(ms):
+    try:
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def session_snapshot(path):
+    result = {"path": path or None, "bytes": None, "entries": None, "header_age_days": None,
+              "mtime": None, "error": None, "stable": None}
+    if not path:
+        result["error"] = "native pi.session label missing"
+        return result
+    try:
+        before = os.stat(path)
+        result["bytes"] = before.st_size
+        result["mtime"] = datetime.fromtimestamp(before.st_mtime, timezone.utc).isoformat(timespec="seconds")
+        header_limit = 64 * 1024
+        with open(path, "rb") as stream:
+            header = stream.readline(header_limit + 1)
+            stream.seek(0)
+            newlines, last_byte, physical_bytes = 0, b"", 0
+            while True:
+                block = stream.read(1024 * 1024)
+                if not block:
+                    break
+                newlines += block.count(b"\n")
+                last_byte = block[-1:]
+                physical_bytes += len(block)
+        physical_lines = newlines + (1 if physical_bytes and last_byte != b"\n" else 0)
+        after = os.stat(path)
+        stable = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == \
+                 (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        result["stable"] = stable
+        if stable:
+            result["entries"] = max(0, physical_lines - 1)
+            try:
+                if len(header) <= header_limit:
+                    metadata = json.loads(header)
+                    created = metadata.get("timestamp") if isinstance(metadata, dict) and metadata.get("type") == "session" else None
+                    if isinstance(created, str):
+                        parsed = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                            result["header_age_days"] = max(0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 86400)
+            except (json.JSONDecodeError, TypeError, ValueError, OverflowError):
+                pass
+        else:
+            result["error"] = "session changed while counting; count omitted"
+    except OSError as exc:
+        result["error"] = f"session inaccessible: {exc.strerror or type(exc).__name__}"
+    return result
+
+
+def cleanup_action(kind, target, inspect_steps, what_freed, risks, undo, recommendation=None):
+    action = {"kind": kind, "target": target, "inspect_steps": inspect_steps,
+              "what_freed": what_freed, "risks": risks, "undo": undo}
+    if recommendation is not None:
+        action["recommendation"] = recommendation
+    return action
+
+
+def label_identity(info, raw):
+    labels = info.get("labels") if isinstance(info.get("labels"), dict) else {}
+    where = labels.get("where") or raw.get("where") or ""
+    parts = where.split(" / ", 1)
+    space = parts[0] if parts else ""
+    tab = parts[1] if len(parts) > 1 else ""
+    kind = labels.get("kind")
+    role = labels.get("role") or kind
+    if not role and (info.get("name") or raw.get("name")) == "herdra" and where == "herdra / main":
+        role = "orchestrator"
+    if not role and tab == "main" and space:
+        role = "Ceph"
+    return {
+        "label": labels.get("label") or info.get("name") or raw.get("name") or space or raw.get("address"),
+        "native_name": info.get("name") or raw.get("name"), "kind": kind, "starter": labels.get("starter"),
+        "task_ref": labels.get("task"),
+        "role": role or "unknown", "project": labels.get("project") or space or None,
+        "owner": labels.get("owner") or labels.get("starter") or info.get("parent"),
+        "address": raw.get("address"), "where": where or None,
+        "status": (info.get("status") or {}).get("state") if isinstance(info.get("status"), dict) else None,
+        "status_ms": info.get("status_ms"), "created_ms": info.get("created_ms"),
+        "parent": info.get("parent"), "cwd": info.get("cwd") or raw.get("cwd"),
+        "pgid": labels.get("pi.pgid"), "session_path": labels.get("pi.session"),
+        "foreground_pid": ((info.get("foreground") or {}).get("pid") if isinstance(info.get("foreground"), dict) else None),
+        "root_pid": info.get("root_pid"), "root_start": info.get("root_start"), "root_name": info.get("root_name"),
+        "root_shell_only": info.get("root_shell_only", False),
+    }
+
+
+def resolve_pi(row, table):
+    """Require a unique Pi process in the advertised group and under the HC foreground root."""
+    try:
+        pgid = int(row["pgid"])
+        root = int(row["root_pid"])
+    except (TypeError, ValueError):
+        return None, "missing native process identity"
+    if root not in table or table[root]["start"] != row.get("root_start"):
+        return None, "HC root process identity changed or unavailable"
+    candidates = []
+    for pid, st in table.items():
+        if st["pgrp"] != pgid:
+            continue
+        exe = proc_exe(pid)
+        if exe not in ("pi", "pi.js", "pi.mjs"):
+            continue
+        if pid == root or pid in descendants(table, root):
+            candidates.append(pid)
+    # Pi also uses its own executable for tool-runtime children. The owner is the
+    # unique outermost Pi under the native root; sibling Pis remain ambiguous.
+    outermost = set(candidates)
+    for candidate in candidates:
+        parent = table[candidate]["ppid"]
+        seen = set()
+        while parent in table and parent not in seen:
+            if parent in outermost:
+                outermost.discard(candidate)
+                break
+            seen.add(parent)
+            parent = table[parent]["ppid"]
+    if len(outermost) != 1:
+        return None, "process identity ambiguous" if outermost else "Pi process not found under HC root"
+    return outermost.pop(), None
+
+
+def safe_hc_get(addr):
+    code, out, err = run(["hc", "get", str(addr), "--json"])
+    if code:
+        fail(f"hc get {addr} failed: {err or 'nonzero exit'}")
+    source = parse_json(out, f"hc get {addr}")
+    labels = source.get("labels") if isinstance(source.get("labels"), dict) else {}
+    foreground = source.get("foreground") if isinstance(source.get("foreground"), dict) else {}
+    status = source.get("status") if isinstance(source.get("status"), dict) else {}
+    root_pid = source.get("pid")
+    root_before = proc_stat(root_pid) if isinstance(root_pid, int) else None
+    root_argv = proc_cmdline(root_pid) if root_before else []
+    root_after = proc_stat(root_pid) if isinstance(root_pid, int) else None
+    root_stable = bool(root_before and root_after and root_before["start"] == root_after["start"])
+    root_argv0 = os.path.basename(root_argv[0]) if root_argv else ""
+    root_exe = proc_exe(root_pid) if isinstance(root_pid, int) else None
+    shell_only = root_stable and bool(root_argv) and root_exe in ("bash", "zsh") and root_argv0 in (root_exe, "-" + root_exe) and all(
+        arg.startswith("-") and arg != "--" and arg not in ("-c", "--command") and
+        not (not arg.startswith("--") and "c" in arg[1:]) for arg in root_argv[1:])
+    # Drop argv and every other unneeded field immediately; nested foreground is whitelisted too.
+    keep_labels = ("label", "where", "role", "kind", "project", "owner", "starter", "parent",
+                   "pi.session", "pi.pgid", "task")
+    return {"name": source.get("name"), "cwd": source.get("cwd"),
+            "labels": {key: labels[key] for key in keep_labels if key in labels},
+            "parent": source.get("parent"), "status": {key: status.get(key) for key in ("app", "state") if key in status},
+            "status_ms": source.get("status_ms"), "created_ms": source.get("created_ms"),
+            "foreground": {key: foreground.get(key) for key in ("name", "pid", "pgid", "cwd") if key in foreground},
+            "root_pid": root_pid, "root_start": root_before["start"] if root_stable else None,
+            "root_name": root_exe, "root_shell_only": shell_only}
+
+
+def pi_snapshot(raw, info, table, native_pi_pids):
+    row = label_identity(info, raw)
+    root_pid = row.get("root_pid")
+    row["root_process_present"] = (root_pid in table and table[root_pid]["start"] == info.get("root_start"))
+    pid, identity_error = resolve_pi(row, table)
+    row["process"] = {"pid": pid, "rss_kib": None, "pss_kib": None,
+                       "descendant_count": None, "additional_descendant_pss_kib": None,
+                       "error": identity_error}
+    if pid is not None:
+        initial = table.get(pid)
+        rss, pss = memory(pid)
+        current = proc_stat(pid)
+        if not current or current["start"] != initial["start"]:
+            row["process"]["error"] = "process identity changed during sample"
+        else:
+            row["process"].update(rss_kib=rss, pss_kib=pss)
+            desc = descendants(table, pid)
+            # A native Pi owns its own row; exclude it and its subtree from this Pi's child total.
+            omitted = set()
+            for other in native_pi_pids:
+                if other != pid and other in desc:
+                    omitted.add(other)
+                    omitted.update(descendants(table, other))
+            measured = desc - omitted
+            total, valid = 0, True
+            for child in measured:
+                value = proc_pss(child)
+                if value is None:
+                    valid = False
+                else:
+                    total += value
+            row["process"]["descendant_count"] = len(measured)
+            row["process"]["additional_descendant_pss_kib"] = total if valid else None
+            row["process"]["descendant_pss_incomplete"] = not valid
+    row["session"] = session_snapshot(row.pop("session_path"))
+    row["native_children"] = []
+    row["flags"] = []
+    return row
+
+
+def rollover_readiness(row):
+    process = row["process"]
+    blockers = []
+    if process.get("error") or not row.get("root_process_present"):
+        blockers.append("Pi or HC root process identity is uncertain")
+    if process.get("pid") is None or process.get("pid") == row.get("root_pid"):
+        blockers.append("no unique Pi below a separate retained root shell")
+    if not row.get("root_shell_only"):
+        blockers.append("HC root is not a proved interactive Bash/Zsh with flags only")
+    if row.get("status") not in ("idle", "done") or row.get("status_ms") is None:
+        blockers.append(f"native status is {row.get('status') or 'unknown'} or has no status timestamp")
+    session = row.get("session") or {}
+    if not session.get("path") or session.get("stable") is not True or session.get("header_age_days") is None:
+        blockers.append("session path/header identity is missing, unstable, or invalid")
+    if row.get("native_children"):
+        blockers.append("live native children remain; settle them through their owner lifecycle")
+    if row.get("starter_owned_manus"):
+        blockers.append("starter-owned manus remain; settle them through their starter")
+    return {"eligible": not blockers and RETAINED_SHELL_PROOF_VERIFIED,
+            "proof_verified": RETAINED_SHELL_PROOF_VERIFIED, "blockers": blockers,
+            "owner_confirmation_required": [
+                "owner confirms durable handoff, no unsettled SDK/helper jobs, and inbox/Task continuity",
+                "Algorant approves this specific live replacement before any command is run"]}
+
+
+def launch_recipe_template():
+    return "\n".join([
+        'LAUNCH=$(python3 - "$CWD" "$HANDOFF" "$NEW_ID" <<\'PY\'',
+        "import shlex, sys", "cwd, note, sid = sys.argv[1:]",
+        "prompt = ('Read the attached handoff and current project rules, Tasks and inbox records. ' 'Confirm exact next step, pending replies and no unsettled children before continuing. ' 'Preserve the project role; do not infer new approvals from this note.')",
+        "print('cd -- ' + shlex.quote(cwd) + ' && ' + shlex.join(['pi', '--session-id', sid, '--', '@' + note, prompt]))",
+        "PY", ")"])
+
+
+def undo_recipe_template():
+    return "\n".join([
+        'UNDO=$(python3 - "$CWD" "$OLD_SESSION" <<\'PY\'',
+        "import shlex, sys", "cwd, old = sys.argv[1:]",
+        "print('cd -- ' + shlex.quote(cwd) + ' && ' + shlex.join(['pi', '--session', old]))",
+        "PY", ")"])
+
+
+def owner_for_pid(pid, pi_rows, table):
+    ancestors = set()
+    current = pid
+    while current in table and current not in ancestors:
+        ancestors.add(current)
+        current = table[current]["ppid"]
+    for row in pi_rows:
+        if row["process"]["pid"] in ancestors:
+            return {"address": row.get("address"), "label": row["label"]}
+    return None
+
+
+def selected_test_env(pid):
+    """Read only scratch-core locator keys; never expose or retain the rest of environ."""
+    selected = {}
+    keys = (b"HC_TEST_ROOT", b"HC_SESSION", b"HOME", b"XDG_RUNTIME_DIR",
+            b"XDG_STATE_HOME", b"XDG_CONFIG_HOME")
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as stream:
+            raw = stream.read(64 * 1024)
+        for item in raw.split(b"\0"):
+            key, sep, value = item.partition(b"=")
+            if not sep or key not in keys:
+                continue
+            name, decoded = key.decode(), value.decode(errors="replace")
+            if name == "HC_SESSION":
+                if decoded.startswith("test-"):
+                    selected[name] = decoded
+            elif decoded.startswith("/tmp/"):
+                selected[name] = os.path.abspath(decoded)
+    except OSError:
+        pass
+    return selected
+
+
+def proc_aux(table, pi_rows):
+    browse, tests, core_rows = [], [], []
+    for pid in table:
+        # Bounded argv prefix stops at the delimiter; prompt text is never classified.
+        prefix = proc_command_prefix(pid)
+        if not prefix:
+            continue
+        exe = (proc_exe(pid) or "").lower()
+        names = [os.path.basename(token.rstrip("/")).lower() for token in prefix]
+
+        runtime = exe in ("node", "bun", "deno")
+        browse_role = None
+        if runtime:
+            for index, token in enumerate(prefix[1:5], start=1):
+                if not os.path.isabs(token) or not os.path.exists(token):
+                    continue
+                parts = {part.lower() for part in Path(token).parts}
+                base = os.path.basename(token).lower()
+                has_package = "npm-opencode-browse" in parts
+                has_mcp = "mcp" in [arg.lower() for arg in prefix[index + 1:index + 5]]
+                if has_package and base == "browse" and has_mcp:
+                    browse_role = "opencode-browse CLI server"
+                    break
+                if has_package and base == "cli.mjs" and "@opencode" in parts and "browse" in parts and has_mcp:
+                    browse_role = "opencode-browse server child"
+                    break
+
+        helper_path = os.path.realpath(os.path.expanduser("~/.pi/agent/scripts/hc-test"))
+        is_test_launcher = exe in ("bash", "sh", "zsh", "python", "python3") and any(
+            os.path.isabs(token) and os.path.basename(token) == "hc-test" and
+            os.path.realpath(token) == helper_path and os.path.isfile(token) for token in prefix[1:4])
+        is_core_server = exe in ("hc", "herdr-core", "herdr_core") and any(
+            name in ("serve", "server") for name in names[1:6])
+        if not browse_role and not is_test_launcher and not is_core_server:
+            continue
+
+        owner = owner_for_pid(pid, pi_rows, table)
+        start = process_start_epoch(table[pid])
+        age = max(0, (time.time() - start) / 3600) if start is not None else None
+        pss = proc_pss(pid)
+
+        if browse_role:
+            owner_address = owner.get("address") if owner else None
+            owner_label = owner.get("label") if owner else None
+            age_flag = "old-age-review" if age is not None and age >= AUX_OLD_HOURS else (
+                "age-unknown-review" if age is None else "owner-review")
+            inspect = []
+            if owner_address:
+                inspect.append(
+                    f"hc get {shlex.quote(str(owner_address))} --json | python3 -c 'import json,sys; d=json.load(sys.stdin); "
+                    "f=d.get(\"foreground\") or {}; l=d.get(\"labels\") or {}; "
+                    "print(json.dumps({\"address\":d.get(\"address\"),\"status\":d.get(\"status\"),"
+                    "\"status_ms\":d.get(\"status_ms\"),\"labels\":{k:l.get(k) for k in (\"where\",\"kind\",\"task\")},"
+                    "\"foreground\":{\"name\":f.get(\"name\"),\"pid\":f.get(\"pid\")}},sort_keys=True))'"
+                )
+            else:
+                inspect.append("Owner association is unknown; identify the owning native Pi before any action.")
+            inspect.extend([
+                "Ask the owner to confirm no browser operation is in flight and identify its established MCP close path.",
+                "Read docs/cleanup.md, Browse-MCP section; this report has no generic stop/restart command."
+            ])
+            browse.append({
+                "pid": pid, "server_role": browse_role, "owner": owner_label,
+                "owner_address": owner_address, "age_hours": age, "pss_kib": pss,
+                "flags": [age_flag],
+                "cleanup": cleanup_action(
+                    "browse-mcp-owner-review", pid, inspect,
+                    f"At most this process's measured {pss if pss is not None else 'unknown'} KiB PSS after an owner-controlled close; not total browser RAM.",
+                    ["Age does not prove idle; closing an active operation can break work or lose browser state."],
+                    "Restart only through its established owner/configuration; unsaved browser state may not be recoverable.",
+                    "Review with the owning Pi; never terminate by PID age or process name."
+                )
+            })
+
+        env = selected_test_env(pid) if is_test_launcher or is_core_server else {}
+        root_hint = None
+        if env.get("HC_TEST_ROOT"):
+            candidate = os.path.realpath(env["HC_TEST_ROOT"])
+            if candidate.startswith("/tmp/"):
+                root_hint = candidate
+        if root_hint is None:
+            for key, suffix in (("XDG_RUNTIME_DIR", "run"), ("XDG_STATE_HOME", "state"),
+                                ("XDG_CONFIG_HOME", "config"), ("HOME", "home")):
+                candidate = env.get(key)
+                if candidate and candidate.startswith("/tmp/") and os.path.basename(candidate) == suffix:
+                    parent = os.path.dirname(candidate)
+                    if parent != "/tmp":
+                        root_hint = parent
+                    break
+        if root_hint is None and env.get("HC_SESSION", "").startswith("test-"):
+            candidate = os.path.join("/tmp", env["HC_SESSION"][5:])
+            if os.path.isdir(candidate):
+                root_hint = os.path.realpath(candidate)
+        if root_hint is None and is_core_server:
+            known_path_options = {"--socket", "--session", "--root", "--runtime-dir", "--data-dir"}
+            args = prefix[1:]
+            for index, token in enumerate(args):
+                value = None
+                if token in known_path_options and index + 1 < len(args):
+                    value = args[index + 1]
+                elif any(token.startswith(option + "=") for option in known_path_options):
+                    value = token.split("=", 1)[1]
+                if value and value.startswith("/tmp/"):
+                    relative = os.path.relpath(value, "/tmp")
+                    root_hint = os.path.join("/tmp", relative.split(os.sep, 1)[0])
+                    break
+
+        isolation_verified = False
+        test_root = env.get("HC_TEST_ROOT")
+        if test_root and root_hint:
+            root = os.path.realpath(test_root)
+            expected = {
+                "HC_SESSION": f"test-{os.path.basename(root)}",
+                "HOME": os.path.join(root, "home"),
+                "XDG_RUNTIME_DIR": os.path.join(root, "run"),
+                "XDG_STATE_HOME": os.path.join(root, "state"),
+                "XDG_CONFIG_HOME": os.path.join(root, "config"),
+            }
+            path_keys = ("HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME")
+            isolation_verified = (root.startswith("/tmp/") and root == root_hint and
+                env.get("HC_SESSION") == expected["HC_SESSION"] and
+                all(env.get(key) == expected[key] and os.path.realpath(expected[key]) == expected[key]
+                    for key in path_keys))
+
+        if is_test_launcher:
+            age_flag = "old-age-review" if age is not None and age >= AUX_OLD_HOURS else (
+                "age-unknown-review" if age is None else "owner-review")
+            steps = []
+            if root_hint and isolation_verified:
+                quoted_root = shlex.quote(root_hint)
+                steps.extend([
+                    f"HC_TEST_ROOT={quoted_root} ~/.pi/agent/scripts/hc-test server status",
+                    f"HC_TEST_ROOT={quoted_root} ~/.pi/agent/scripts/hc-test ls --json",
+                    "Do not stop this launcher by PID; its original test owner must settle the harness."
+                ])
+            else:
+                steps.append("Test-core isolation is unknown/legacy; do not run a stop command or bare hc server stop.")
+            tests.append({
+                "pid": pid, "owner": owner.get("label") if owner else None, "age_hours": age,
+                "pss_kib": pss, "root": root_hint, "isolation_verified": isolation_verified,
+                "flags": [age_flag],
+                "cleanup": cleanup_action(
+                    "hc-test-launcher-review", pid, steps,
+                    f"At most this launcher's measured {pss if pss is not None else 'unknown'} KiB PSS after its owner finishes the test.",
+                    ["An old launcher may still own active tests; process age does not prove the harness is idle."],
+                    "The original owner reruns the documented test through hc-test; terminal state may not be recoverable.",
+                    "Review with the original test owner; do not terminate by process name."
+                )
+            })
+
+        if is_core_server:
+            core_rows.append({
+                "pid": pid, "owner": owner.get("label") if owner else None,
+                "age_hours": age, "pss_kib": pss, "root": root_hint,
+                "protected_tmp_root": (os.path.join("/tmp", os.path.relpath(root_hint, "/tmp").split(os.sep, 1)[0])
+                                       if root_hint and root_hint.startswith("/tmp/") else None),
+                "isolation_verified": isolation_verified
+            })
+
+    grouped = {}
+    for row in core_rows:
+        key = ("root", row["root"]) if row["root"] else ("pid", row["pid"])
+        grouped.setdefault(key, []).append(row)
+    cores = []
+    for (key_kind, key_value), rows in sorted(grouped.items(), key=lambda item: str(item[0])):
+        pids = sorted({row["pid"] for row in rows})
+        root = key_value if key_kind == "root" else None
+        verified = bool(root) and all(row["isolation_verified"] for row in rows)
+        age = max((row["age_hours"] for row in rows if row["age_hours"] is not None), default=None)
+        pss_values = [row["pss_kib"] for row in rows]
+        total_pss = sum(value for value in pss_values if value is not None) if all(value is not None for value in pss_values) else None
+        flags = ["old-age-review"] if age is None or age >= AUX_OLD_HOURS else ["owner-review"]
+        if not verified:
+            flags.append("KEEP-unverified-core")
+            inspect = ["hc ls --json  # inspect native terminal inventory; do not stop this core."]
+            recommendation = "KEEP: isolation is unverified or this is the real HC core; never stop it from this report."
+            action = cleanup_action(
+                "hc-core-keep", root or f"PID {pids[0]}", inspect,
+                "None; this core is explicitly retained.",
+                ["Stopping the real or an ambiguously isolated HC core would interrupt unrelated terminals."],
+                "No undo is promised for a stopped real/legacy core; keep it running.",
+                recommendation
+            )
+        else:
+            quoted_root = shlex.quote(root)
+            pid_note = ", ".join(map(str, pids))
+            inspect = [
+                f"HC_TEST_ROOT={quoted_root} ~/.pi/agent/scripts/hc-test server status",
+                f"HC_TEST_ROOT={quoted_root} ~/.pi/agent/scripts/hc-test ls --json",
+                f"Confirm with the owner that every test terminal is disposable; a single helper socket may address only one current core.",
+                f"HC_TEST_ROOT={quoted_root} ~/.pi/agent/scripts/hc-test server stop  # only after owner confirmation",
+                f"Afterward verify every original serve PID is absent: {pid_note}, check for residual same-root processes, and never kill as fallback."
+            ]
+            action = cleanup_action(
+                "isolated-hc-test-core-review", root, inspect,
+                f"At most {total_pss if total_pss is not None else 'unknown'} KiB summed PSS across {len(pids)} distinct serve PIDs.",
+                ["Age does not prove tests are idle; duplicate serve PIDs may share one socket, and stopping the addressed core may leave a residual process."],
+                "The original owner reruns its documented test through the same scoped hc-test root; stopped terminal state may not be recoverable.",
+                "Review the exact isolated root with its owner; no stop command is authorized by this report."
+            )
+        cores.append({
+            "kind": "HC serve process group", "root": root, "pids": pids,
+            "processes": rows, "age_hours": age, "pss_kib": total_pss,
+            "isolation_verified": verified, "flags": flags, "cleanup": action
+        })
+    return browse, tests, cores
+
+def du_bytes(path, active_paths):
+    total, uncertain, protections = 0, False, set()
+    now = time.time()
+    try:
+        root_device = os.lstat(path).st_dev
+    except OSError:
+        return None, True, ["root stat failed"]
+    errors = []
+    def onerror(exc):
+        errors.append(exc)
+    try:
+        for base, dirs, files in os.walk(path, followlinks=False, onerror=onerror):
+            for name in list(dirs) + files:
+                p = os.path.join(base, name)
+                try:
+                    st = os.lstat(p)
+                    rel = os.path.relpath(p, path).lower()
+                    if st.st_dev != root_device:
+                        protections.add("mount/device boundary")
+                        uncertain = True
+                        if name in dirs:
+                            dirs.remove(name)
+                        continue
+                    if st.st_uid != os.getuid():
+                        protections.add("other-owner entry")
+                    if max(st.st_mtime, st.st_ctime) > now - TMP_STALE_HOURS * 3600:
+                        protections.add("fresh descendant")
+                    if stat.S_ISLNK(st.st_mode):
+                        protections.add("symlink in tree")
+                        if name in dirs:
+                            dirs.remove(name)
+                    elif stat.S_ISDIR(st.st_mode):
+                        pass
+                    elif not stat.S_ISREG(st.st_mode):
+                        protections.add("socket, fifo, or device")
+                    else:
+                        total += st.st_size
+                    if rel.endswith(".jsonl") or any(part in KNOWN_HC_TEST_ROOTS for part in Path(rel).parts) or re.search(r"session|history|hc[-_]?test|test[-_]?core|child[-_]?report|pi[-_]?report|algos-mockups|mise-src", rel):
+                        protections.add("session/runtime/report or named protected tree")
+                    if p in active_paths:
+                        protections.add("process cwd/open file below tree")
+                except (OSError, ValueError):
+                    uncertain = True
+    except OSError:
+        uncertain = True
+    if errors:
+        uncertain = True
+        protections.add("unreadable directory")
+    return total, uncertain, sorted(protections)
+
+
+def active_tmp_paths():
+    active = set()
+    try:
+        pids = os.scandir("/proc")
+    except OSError:
+        return active
+    with pids:
+        for entry in pids:
+            if not entry.name.isdigit():
+                continue
+            base = f"/proc/{entry.name}"
+            for name in ("cwd",):
+                try:
+                    target = os.readlink(f"{base}/{name}")
+                    active.add(os.path.abspath(target))
+                except OSError:
+                    pass
+            try:
+                fds = os.scandir(f"{base}/fd")
+                with fds:
+                    for fd in fds:
+                        try:
+                            target = os.readlink(fd.path)
+                            if target.startswith("/tmp/") and not target.endswith(" (deleted)"):
+                                active.add(os.path.abspath(target))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    return active
+
+
+def tmp_snapshot(protected_roots=()):
+    roots = []
+    errors = []
+    protected_roots = {os.path.abspath(path) for path in protected_roots}
+    active_paths = active_tmp_paths()
+    now = time.time()
+    try:
+        entries = sorted(os.scandir("/tmp"), key=lambda e: e.name)
+    except OSError as exc:
+        return {"error": f"cannot inspect /tmp: {exc.strerror or type(exc).__name__}", "roots": []}
+    with_entries = entries
+    for ent in with_entries:
+        path = ent.path
+        try:
+            st = ent.stat(follow_symlinks=False)
+        except OSError as exc:
+            errors.append({"path": path, "error": exc.strerror or type(exc).__name__})
+            continue
+        age = max(0, (now - max(st.st_mtime, st.st_ctime)) / 3600)
+        if not stat.S_ISDIR(st.st_mode):
+            size, uncertain, protections = st.st_size, False, []
+            if not stat.S_ISREG(st.st_mode):
+                protections.append("socket, fifo, device, or symlink root")
+        else:
+            size, uncertain, protections = du_bytes(path, active_paths)
+        name = ent.name.lower()
+        if name in KNOWN_HC_TEST_ROOTS or re.search(r"(session|history|hc[-_]?test|test[-_]?core|child[-_]?report|pi[-_]?report|algos-mockups|mise-src)", name):
+            protections.append("protected root name")
+        if os.path.abspath(path) in protected_roots:
+            protections.append("HC test-core root identified from selected process metadata")
+        if any(os.path.commonpath([path, active]) == path for active in active_paths if active.startswith("/tmp/")):
+            protections.append("process cwd/open file in tree")
+        protected = bool(protections)
+        flags = []
+        status = "recent"
+        how = None
+        review_candidate = False
+        if st.st_uid != os.getuid():
+            protections.append("other-owner root")
+            protected = True
+        if ent.is_symlink():
+            protections.append("symlink root")
+            protected = True
+        if age >= TMP_STALE_HOURS and not protected and not uncertain:
+            status = "stale review only; task-140 protections must be repeated; not a candidate"
+            review_candidate = True
+            quoted = shlex.quote(path)
+            how = [f"stat -- {quoted}", f"du -sh -- {quoted}", f"findmnt -T {quoted}",
+                   f"lsof +D {quoted}  # may be expensive; inspect before use",
+                   "Read docs/cleanup.md; no deletion is performed by this report."]
+        elif protected:
+            status = "protected / inspect only"
+        elif uncertain:
+            status = "incomplete scan; retain"
+        roots.append({"path": path, "bytes": size if not uncertain else None, "age_hours": age,
+                      "mtime": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                      "ctime": datetime.fromtimestamp(st.st_ctime, timezone.utc).isoformat(timespec="seconds"),
+                      "status": status, "cleanup": None, "flags": flags,
+                      "_review_candidate": review_candidate, "_inspect_steps": how})
+    candidates = sorted((root for root in roots if root["_review_candidate"]),
+                        key=lambda root: root["bytes"] if root["bytes"] is not None else -1, reverse=True)
+    for root in candidates:
+        root["flags"] = ["STALE /tmp review"]
+        root["cleanup"] = cleanup_action("tmp-review", root["path"], root["_inspect_steps"],
+            f"up to {root['bytes']} bytes of apparent file size; tmpfs allocation differs",
+            ["open handles, fresh descendants, ownership, and concurrent writes need manual verification"],
+            "No automatic undo; retain or restore from the owning application's source.",
+            "review only; task-140 protections must be repeated; do not delete")
+    for root in roots:
+        root.pop("_review_candidate", None)
+        root.pop("_inspect_steps", None)
+    return {"roots": roots, "errors": errors, "stale_review_count": len(candidates)}
+
+
+def outcome_review_action(row):
+    name = row.get("native_name") or row.get("address")
+    agent = json.dumps(name)
+    task_ref = row.get("task_ref")
+    task_id = task_ref.rsplit(":", 1)[-1] if task_ref else None
+    steps = []
+    kind = (row.get("kind") or row.get("role") or "").lower()
+    if kind == "worker":
+        steps.extend([
+            f"worker_status {{agent: {agent}}}",
+            f"worker_handoff {{agent: {agent}}}",
+            f"worker_finish {{agent: {agent}}}  # only after starter verifies scope, checks, and required acceptance",
+            f"worker_discard {{agent: {agent}, note: \"specific authorized reason\"}}  # never infer discard approval",
+        ])
+    else:
+        steps.extend([
+            "~/.pi/agent/scripts/inbox open  # starter reviews the durable delivery/request thread",
+            f"git -C {shlex.quote(str(row.get('cwd') or '.'))} status --short",
+            f"git -C {shlex.quote(str(row.get('cwd') or '.'))} rev-parse HEAD",
+        ])
+        if task_id:
+            steps.append(f"cd {shlex.quote(str(row.get('cwd') or '.'))} && tandem show {shlex.quote(task_id)}")
+        else:
+            steps.append("Task reference unavailable; starter must identify it from the delivery, not infer one.")
+        steps.extend([
+            f"worker_finish {{agent: {agent}}}  # starter only, after verifying delivery, checkout, checks and required acceptance",
+            f"worker_discard {{agent: {agent}, note: \"specific authorized reason\"}}  # only an authorized disposable attempt",
+        ])
+    children = row.get("native_children") or []
+    owned_manus = row.get("starter_owned_manus") or []
+    if row["process"].get("error"):
+        steps.append("Process identity is uncertain; do not perform any process/session action.")
+    if children or owned_manus:
+        blockers = []
+        if children:
+            blockers.append("live native children: " + ", ".join(child["name"] for child in children))
+        if owned_manus:
+            blockers.append("starter-owned manus: " + ", ".join(child["label"] for child in owned_manus))
+        steps.append("DEFER outcome action until these live child records are settled by their owners: " + "; ".join(blockers))
+    else:
+        steps.append("Native done/idle is not acceptance; the starter verifies the real handoff, Task, checkout and required checks before any finish/discard lifecycle action.")
+    recommendation = ("DEFER: process identity is uncertain; do not perform a live action."
+                      if row["process"].get("error") else
+                      "DEFER: settle the live child records first; the starter then verifies the outcome."
+                      if children or owned_manus else
+                      "Starter must inspect delivery and acceptance; native status never authorizes finish or discard.")
+    return cleanup_action(
+        "agent-outcome-review", row["address"], steps,
+        "Only the agent's process/terminal through its existing verified finish lifecycle; no memory saving is inferred from session size.",
+        ["Finishing unverified work can merge the wrong result; discarding unaccepted work can lose changes."],
+        "Preserve the actual worktree/receipt; use its recorded git revert for an incorrect integration, and never discard without authority.",
+        recommendation
+    )
+
+
+def suggestion(row):
+    flags = []
+    session = row["session"]
+    proc = row["process"]
+    if proc.get("pss_kib") is not None and proc["pss_kib"] >= HEAVY_PSS:
+        flags.append("heavy-pi-pss")
+    if session.get("bytes") is not None and session["bytes"] >= HEAVY_SESSION:
+        flags.append("heavy-session-bytes")
+    if session.get("entries") is not None and session["entries"] >= HEAVY_ENTRIES:
+        flags.append("heavy-session-entries")
+    age_days = session.get("header_age_days")
+    if age_days is not None and age_days >= OLD_DAYS and session.get("bytes", 0) >= OLD_BYTES:
+        flags.append("old-large-session")
+    status = (row.get("status") or "unknown").lower()
+    last_write = session.get("mtime")
+    quiet = False
+    if last_write:
+        try:
+            quiet = (time.time() - datetime.fromisoformat(last_write).timestamp()) >= QUIET_HOURS * 3600
+        except ValueError:
+            pass
+    if quiet and status not in ("working", "blocked"):
+        flags.append("quiet-not-working")
+    kind = (row.get("kind") or row.get("role") or "").lower()
+    outcome = kind in ("manus", "worker") and status in ("done", "idle")
+    if outcome:
+        flags.append("outcome-review")
+    defer = (status in ("working", "blocked") or status not in ("working", "blocked", "done", "idle") or
+             row["process"].get("error") or bool(row.get("children")) or bool(row.get("starter_owned_manus")))
+    row["flags"] = flags
+    if not flags:
+        return None
+    if outcome:
+        return outcome_review_action(row)
+    readiness = row.get("rollover_readiness") or {"eligible": False, "blockers": ["readiness unavailable"]}
+    if defer:
+        action = "defer; do not interrupt; ask the owner to review after work and children settle"
+    elif readiness["eligible"]:
+        action = "retained-shell recipe may be proposed after owner confirms handoff/jobs and Algorant approves this exact live replacement"
+    else:
+        action = "defer; satisfy the retained-shell preconditions or use the owner's existing finish lifecycle"
+    inspect = [f"bin/herdra-tidy --pi {shlex.quote(str(row['address']))}  # refresh immediately before any approved action",
+        f"hc get {shlex.quote(str(row['address']))} --json | python3 -c 'import json,sys; d=json.load(sys.stdin); f=d.get(\"foreground\") or {{}}; l=d.get(\"labels\") or {{}}; print(json.dumps({{\"address\":d.get(\"address\"),\"root_pid\":d.get(\"pid\"),\"status\":d.get(\"status\"),\"status_ms\":d.get(\"status_ms\"),\"labels\":{{k:l.get(k) for k in (\"where\",\"kind\",\"starter\",\"pi.session\",\"pi.pgid\",\"task\")}},\"foreground\":{{k:f.get(k) for k in (\"name\",\"pid\")}}}}, sort_keys=True))'",
+        "Check the owner's Task/inbox and confirm zero live children, zero starter-owned manus, and no unsettled SDK/helper jobs.",
+        "Read docs/cleanup.md; no report grants approval and no command below is executed by this report."]
+    if readiness["eligible"]:
+        target = shlex.quote(str(row["address"]))
+        cwd = shlex.quote(str(row.get("cwd") or "<verified-cwd>"))
+        old_session = shlex.quote(str(row["session"].get("path") or "<verified-old-session>"))
+        old_pid = str(row["process"].get("pid"))
+        root_pid = str(row.get("root_pid"))
+        inspect.extend([
+            f"# After durable owner handoff and Algorant's specific approval only: TARGET={target}; CWD={cwd}; OLD_SESSION={old_session}; OLD_PI_PID={old_pid}; ROOT_PID={root_pid}",
+            "HANDOFF='/absolute/owner-supplied/handoff-note.md'  # operator supplies exact existing note after approval",
+            "NEW_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')  # generate only after approval",
+            'hc keys "$TARGET" ctrl+d  # only at confirmed idle prompt; stop only the Pi',
+            'hc get "$TARGET" --json | python3 -c \'import json,sys; d=json.load(sys.stdin); f=d.get("foreground") or {}; l=d.get("labels") or {}; print(json.dumps({"address":d.get("address"),"root_pid":d.get("pid"),"status":d.get("status"),"status_ms":d.get("status_ms"),"pi_labels":{k:l.get(k) for k in ("pi.session","pi.pgid")},"foreground":{"name":f.get("name"),"pid":f.get("pid")}},sort_keys=True))\'  # same address/root, cleared Pi labels/status',
+            'test ! -e "/proc/$OLD_PI_PID"  # verify old process exited before replacement',
+            "# Launch template from docs/cleanup.md; shell quoting and operator-supplied HANDOFF/NEW_ID are required:",
+            launch_recipe_template(),
+            'hc send "$TARGET" "$LAUNCH"  # only after same-root/no-old-PID checks',
+            'hc get "$TARGET" --json | python3 -c \'import json,sys; d=json.load(sys.stdin); f=d.get("foreground") or {}; l=d.get("labels") or {}; print(json.dumps({"address":d.get("address"),"root_pid":d.get("pid"),"status":d.get("status"),"pi_labels":{k:l.get(k) for k in ("pi.session","pi.pgid")},"foreground":{"name":f.get("name"),"pid":f.get("pid")}},sort_keys=True))\'  # verify new session/pgid/PID and same root/address',
+            "# Read only the first session-header JSON object and verify its id equals NEW_ID; confirm handoff, queued inbox, and no live children.",
+            f"bin/herdra-tidy --pi {target}  # measure actual post-start PSS; no saving is promised",
+            'hc keys "$TARGET" ctrl+d  # undo only at confirmed idle prompt; retain all new work',
+            'test ! -e "/proc/$NEW_PI_PID"  # after capturing replacement PID, verify it exited and the same root remains',
+            undo_recipe_template(), 'hc send "$TARGET" "$UNDO"  # resume OLD_SESSION only after exact root/PID checks'])
+    else:
+        inspect.append("Deferred: " + "; ".join(readiness["blockers"]))
+        inspect.append("For a Worker use the starter's verified handoff and existing worker_finish/worker_discard lifecycle; for a manus, its starter verifies delivery. Otherwise defer; no direct wrapper restart.")
+    return cleanup_action("pi-session-review", row["address"], inspect,
+        "Potential Pi process/descendant memory only after a separately approved, verified fresh-process handoff; transcript size is not RAM savings.",
+        ["working/blocked state, unresolved children, queued inbox continuity, and ownership can be disrupted",
+         "a disposable proof's ordinary native child disappeared; child survival/adoption is never assumed"],
+        "Follow docs/cleanup.md undo: preserve both sessions/work, stop the replacement only at its confirmed idle prompt, verify the retained root and replacement PID exit, then resume the old session through that same root; stop on any mismatch.", action)
+
+
+AGENT_SHELLS = {"zsh", "bash", "sh", "dash", "fish", "nu", "ksh", "tcsh", "elvish"}
+DECISION_WIDTH = 11
+
+
+def short_path(path):
+    if not path:
+        return "its checkout"
+    for home in (os.path.expanduser("~"), "~"):
+        if home and path.startswith(home + "/"):
+            return "~" + path[len(home):]
+    return path
+
+
+def agent_git_state(machine, cwd, cache):
+    """Uncommitted or unmerged work in one checkout, sampled at most once per run."""
+    key = (machine, cwd)
+    if key in cache:
+        return cache[key]
+    state = {"dirty": None, "unmerged": None, "branch": None, "bases": [], "error": None}
+    cache[key] = state
+    if not cwd:
+        state["error"] = "no working directory"
+        return state
+    prefix = ["hc", "exec", "--on", machine, "--"] if machine else []
+
+    def git(*arguments):
+        return run(prefix + ["git", "-C", cwd, *arguments], timeout=45)
+
+    code, out, err = git("status", "--porcelain", "--branch")
+    if code:
+        state["error"] = err.splitlines()[-1] if err else f"git status exited {code}"
+        return state
+    rows = out.splitlines()
+    header = rows[0] if rows and rows[0].startswith("## ") else ""
+    state["dirty"] = any(row.strip() for row in (rows[1:] if header else rows))
+    if header:
+        branch = header[3:].split("...", 1)[0].strip()
+        state["branch"] = branch if branch and branch != "HEAD (no branch)" else None
+    code, out, _ = git("for-each-ref", "--format=%(refname)",
+                       "refs/heads/main", "refs/heads/master", "refs/remotes/origin/HEAD")
+    bases = [row.strip() for row in out.splitlines() if row.strip()] if code == 0 else []
+    state["bases"] = bases
+    if not bases:
+        state["error"] = "no main, master or origin/HEAD to compare with"
+        return state
+    if state["branch"] and f"refs/heads/{state['branch']}" in bases:
+        state["unmerged"] = 0
+        return state
+    code, out, err = git("rev-list", "--count", "HEAD", *[f"^{base}" for base in bases])
+    if code == 0 and out.strip().isdigit():
+        state["unmerged"] = int(out.strip())
+    else:
+        state["error"] = err.splitlines()[-1] if err else f"git rev-list exited {code}"
+    return state
+
+
+def agents_inventory():
+    code, out, err = run(["herdr-app", "ls"], timeout=60)
+    if code:
+        fail(f"herdr-app ls failed: {err or f'exit {code}'}")
+    spaces = parse_json(out, "herdr-app ls").get("spaces")
+    if not isinstance(spaces, list):
+        fail("herdr-app ls lists no spaces")
+    connected = set()
+    code, out, err = run(["hc", "machine", "ls", "--json"], timeout=60)
+    if code:
+        print(f"herdra-tidy: hc machine ls failed ({err or f'exit {code}'}); checking this machine only",
+              file=sys.stderr)
+    else:
+        for machine in parse_json(out, "hc machine ls").get("machines", []):
+            if isinstance(machine, dict) and machine.get("state") == "connected" and machine.get("name"):
+                connected.add(machine["name"])
+    code, out, err = run(["hc", "ls", "--json"], timeout=60)
+    if code:
+        fail(f"hc ls failed: {err or f'exit {code}'}")
+    terminals = {}
+    for row in parse_json(out, "hc ls").get("terminals", []):
+        if isinstance(row, dict) and row.get("address"):
+            terminals[row["address"]] = row
+    return [space for space in spaces if isinstance(space, dict)], connected, terminals
+
+
+def agent_tab_lines(spaces, connected, terminals, only_space, close):
+    children = {}
+    for address, row in terminals.items():
+        if row.get("parent"):
+            children.setdefault(row["parent"], []).append(address)
+    provenance, git_states = {}, {}
+
+    def labels_of(address):
+        if address not in provenance:
+            info = {}
+            code, out, _ = run(["hc", "get", address, "--json"], timeout=30)
+            if code == 0:
+                labels = parse_json(out, f"hc get {address}").get("labels")
+                labels = labels if isinstance(labels, dict) else {}
+                info = {key: labels[key] for key in ("kind", "role", "label", "starter", "task")
+                        if labels.get(key)}
+            provenance[address] = info
+        return provenance[address]
+
+    results, matched = [], False
+    for space in spaces:
+        space_name = str(space.get("name") or "?")
+        machine = space.get("machine") or None
+        tabs = [tab for tab in space.get("tabs") or [] if isinstance(tab, dict)]
+        if only_space and space_name.lower() != only_space.lower():
+            continue
+        matched = True
+        if machine and machine not in connected:
+            results.append({"decision": "not checked", "space": space_name, "tab": None,
+                            "terminal": machine, "tab_id": None,
+                            "reason": f"{machine} unreachable; {len(tabs)} tab(s) not checked"})
+            continue
+        tab_names = [str(tab.get("name") or "").lower() for tab in tabs]
+        space_pis = [term for tab in tabs for term in tab.get("terminals") or []
+                     if terminals.get((term or {}).get("terminal"), {}).get("agent") == "pi"]
+        sole_pi = len(space_pis) == 1 and "main" not in tab_names
+
+        def classify(tab_name, term):
+            address = term.get("terminal")
+            row = terminals.get(address) or {}
+            agent = row.get("agent") or term.get("app")
+            if agent != "pi":
+                if agent in AGENT_SHELLS or not agent:
+                    return "keep", "shell"
+                return "ask", f"program {agent} (not a Pi agent)"
+            lowered = tab_name.lower()
+            name = str(term.get("name") or "").lower()
+            info = labels_of(address)
+            role_label = str(info.get("kind") or info.get("role") or "").lower()
+            # A Ceph is never closed, wherever its tab sits and whatever the tab is called.
+            if role_label in ("ceph", "herdra") or (name and name == space_name.lower()):
+                if role_label == "herdra" or name == "herdra" or space_name.lower() == "herdra":
+                    return "keep", "Herdra"
+                return "keep", "space Ceph"
+            if lowered == "main":
+                if space_name.lower() == "herdra" or name == "herdra":
+                    return "keep", "Herdra"
+                return "keep", "space Ceph (main tab)"
+            if lowered == "tandem":
+                return "keep", "tandem tab"
+            if not row:
+                return "keep", "no live terminal in hc"
+            status = str(row.get("status") or "").lower()
+            if status not in ("idle", "done"):
+                return "keep", f"status {status or 'unknown'}"
+            live = sorted({str(child) for child in list(term.get("sub_agents") or []) +
+                           children.get(address, [])})
+            if live:
+                return "keep", f"live child {', '.join(live)}"
+            if not (info.get("kind") or info.get("role") or info.get("starter") or
+                    info.get("task") or row.get("parent")):
+                if sole_pi:
+                    return "keep", "only Pi in space (space Ceph)"
+                return "ask", "no parent, starter or task label"
+            role = str(info.get("kind") or info.get("role") or "agent").lower()
+            state = agent_git_state(machine, row.get("cwd"), git_states)
+            if state["error"]:
+                return "keep", f"checkout state unknown ({state['error']})"
+            if state["dirty"]:
+                return "keep", f"uncommitted work in {short_path(row.get('cwd'))}"
+            if state["unmerged"]:
+                where = f" on {state['branch']}" if state["branch"] else ""
+                return "keep", f"{state['unmerged']} unmerged commit(s){where}"
+            saved = f"clean {state['branch'] or 'detached'} checkout"
+            return "close", f"{status} {role}, session saved, {saved}"
+
+        for tab in tabs:
+            tab_name = str(tab.get("name") or "")
+            tab_terminals = [term for term in tab.get("terminals") or [] if isinstance(term, dict)]
+            if not tab_terminals:
+                results.append({"decision": "keep", "space": space_name, "tab": tab_name,
+                                "terminal": "-", "tab_id": tab.get("id"),
+                                "reason": "no terminal in this tab"})
+                continue
+            graded = [classify(tab_name, term) for term in tab_terminals]
+            order = {"close": 0, "ask": 1, "keep": 2}
+            decision = max((grade[0] for grade in graded), key=lambda value: order[value])
+            reasons = []
+            for grade, reason in graded:
+                if grade == decision and reason not in reasons:
+                    reasons.append(reason)
+            reason = "; ".join(reasons)
+            if len(tab_terminals) > 1:
+                reason = f"{len(tab_terminals)} terminals · {reason}"
+            results.append({"decision": decision, "space": space_name, "tab": tab_name,
+                            "terminal": ",".join(str(term.get("terminal")) for term in tab_terminals),
+                            "tab_id": tab.get("id"), "reason": reason})
+
+    if only_space and not matched:
+        known = ", ".join(sorted(str(space.get("name") or "?") for space in spaces))
+        fail(f"no space named {only_space!r} (have: {known})")
+
+    print(f"herdra-tidy --agents · {os.uname().nodename} · "
+          f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}"
+          + (f" · space {only_space}" if only_space else ""))
+    for row in results:
+        target = f"{row['space']} / {row['tab']}" if row["tab"] else row["space"]
+        print(f"{row['decision']:<{DECISION_WIDTH}} {target} · {row['terminal']} · {row['reason']}")
+
+    counts = {}
+    for row in results:
+        counts[row["decision"]] = counts.get(row["decision"], 0) + 1
+    closed = failed = 0
+    if close:
+        for row in results:
+            if row["decision"] != "close" or not row["tab_id"]:
+                continue
+            code, _, err = run(["herdr-app", "do", "tab.close", "--id", str(row["tab_id"]),
+                                "--confirmed", "true"], timeout=60)
+            if code:
+                failed += 1
+                print(f"herdra-tidy: could not close {row['space']} / {row['tab']}: "
+                      f"{err or f'exit {code}'}", file=sys.stderr)
+            else:
+                closed += 1
+    kept = counts.get("keep", 0)
+    ask = counts.get("ask", 0)
+    unchecked = counts.get("not checked", 0)
+    if close:
+        summary = f"closed {closed} · kept {kept} · ask {ask} · not checked {unchecked}"
+        if failed:
+            summary += f" · failed {failed}"
+    else:
+        summary = (f"would close {counts.get('close', 0)} · kept {kept} · ask {ask} · "
+                   f"not checked {unchecked} · dry run, nothing closed")
+    print(f"summary: {summary}")
+    if close and failed:
+        raise SystemExit(1)
+
+
+def self_metrics():
+    rss, _ = proc_status(os.getpid())
+    return {"elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+            "child_subprocess_launches": launches,
+            "self_cpu_ms": round((time.process_time() - cpu_started) * 1000, 2),
+            "self_rss_kib": rss}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Read-only one-shot cleanup snapshot")
+    parser.add_argument("--pi", metavar="NAME-OR-ADDRESS", help="filter to one native Pi name/address")
+    parser.add_argument("--json", action="store_true", help="emit the snapshot as JSON")
+    parser.add_argument("--agents", action="store_true",
+                        help="one line per agent tab in every project space: keep, close or ask")
+    parser.add_argument("--close", action="store_true",
+                        help="with --agents: close the tabs listed as close")
+    parser.add_argument("--space", metavar="NAME",
+                        help="with --agents: only this space, so a Ceph can check its own")
+    args = parser.parse_args()
+    if args.agents:
+        if args.pi or args.json:
+            fail("--agents does not take --pi or --json")
+        spaces, connected, terminals = agents_inventory()
+        agent_tab_lines(spaces, connected, terminals, args.space, args.close)
+        return
+    if args.close or args.space:
+        fail("--close and --space only work with --agents")
+    code, out, err = run(["hc", "ls", "--json"])
+    if code:
+        fail(f"hc ls failed: {err or 'nonzero exit'}")
+    listing = parse_json(out, "hc ls")
+    terms = listing.get("terminals")
+    if not isinstance(terms, list):
+        fail("hc ls JSON has no terminal inventory")
+    observed_pis = [t for t in terms if t.get("state") == "live" and t.get("agent") == "pi"]
+    # hc ls already federates connected machines. Never interpret their PIDs/paths locally.
+    live_pis = [t for t in observed_pis if "/" not in str(t.get("address", ""))]
+    # Build process identity set from safe whitelisted hc reads before per-row accounting.
+    identities = []
+    safe_infos = []
+    for raw in live_pis:
+        info = safe_hc_get(raw.get("address"))
+        safe_infos.append(info)
+        identities.append(label_identity(info, raw))
+    table = process_table()
+    native_pids = set()
+    for row in identities:
+        pid, _ = resolve_pi(row, table)
+        if pid is not None:
+            native_pids.add(pid)
+    selected = []
+    for raw, info, identity in zip(live_pis, safe_infos, identities):
+        needle = args.pi
+        if needle and needle not in (identity.get("address"), identity.get("native_name")):
+            continue
+        row = pi_snapshot(raw, info, table, native_pids)
+        children = [child for child in terms if child.get("state") == "live" and child.get("parent") == raw.get("address")]
+        row["native_children"] = [{"address": child.get("address"), "name": child.get("name") or child.get("address"),
+                                    "status": child.get("status")} for child in children]
+        row["children"] = row["native_children"]
+        owner_names = {value for value in (identity.get("address"), identity.get("native_name"), identity.get("label")) if value}
+        row["starter_owned_manus"] = [{"address": other.get("address"), "label": other.get("label"), "status": other.get("status")}
+            for other in identities if other.get("address") != identity.get("address") and other.get("kind") == "manus"
+            and other.get("starter") in owner_names]
+        row["rollover_readiness"] = rollover_readiness(row)
+        recommendation = suggestion(row)
+        row["cleanup"] = recommendation
+        selected.append(row)
+    selected.sort(key=lambda row: row["process"].get("pss_kib") or -1, reverse=True)
+    if args.pi and not selected:
+        fail(f"no live local Pi matched --pi {args.pi!r}")
+    all_pi_rows = []
+    for identity in identities:
+        pid, _ = resolve_pi(identity, table)
+        all_pi_rows.append({"address": identity["address"], "label": identity["label"], "process": {"pid": pid}})
+    browse, test_processes, core_processes = proc_aux(table, all_pi_rows)
+    browse_pss = [p["pss_kib"] for p in browse]
+    browse_total_pss = (sum(browse_pss) if browse_pss and all(value is not None for value in browse_pss)
+                        else 0 if not browse_pss else None)
+    remote_pis = []
+    for remote in observed_pis:
+        address = str(remote.get("address", ""))
+        if "/" not in address:
+            continue
+        machine, native_address = address.split("/", 1)
+        where = remote.get("where") or ""
+        remote_pis.append({"machine": machine, "address": address,
+            "label": remote.get("name") or native_address, "role": "unknown",
+            "project": where.split(" / ", 1)[0] or None, "owner": None,
+            "where": where or None, "status": remote.get("status"),
+            "session_bytes": None, "session_entries": None, "session_age_days": None,
+            "rss_kib": None, "pss_kib": None, "sampled_here": False})
+    coverage = [{"machine": machine.get("name"), "state": machine.get("state"),
+                 "sampled_here": False,
+                 "live_remote_pi_count": sum(row["machine"] == machine.get("name") for row in remote_pis),
+                 "note": "native inventory only; remote resource/session metrics are not sampled here"}
+                for machine in listing.get("machines", []) if isinstance(machine, dict)]
+    result = {"version": VERSION, "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "local_host": os.uname().nodename, "read_only": True,
+              "pis": selected, "remote_pis": remote_pis, "coverage": {"local_live_pi_count": len(live_pis),
+              "selected_pi_count": len(selected), "remote_live_pi_count": len(remote_pis), "remote_machines": coverage},
+              "browse_mcp": {"process_count": len(browse), "processes": browse,
+              "total_pss_kib": browse_total_pss},
+              "hc_test_processes": test_processes, "hc_core_processes": core_processes,
+              "tmp": (tmp_snapshot([p["protected_tmp_root"] for p in core_processes if p.get("protected_tmp_root")]) if not args.pi
+                      else {"skipped": "--pi focused report; /tmp inventory not sampled", "roots": []}), "cost": self_metrics(),
+              "disclaimer": "Recommendations only; no messages, file changes, cleanup, process action, or restart was performed."}
+    tmp_by_path = {root["path"]: root for root in result["tmp"].get("roots", [])}
+    identified_roots = {p["root"] for p in core_processes if p.get("root")}
+    named_roots = {path for path in tmp_by_path if os.path.basename(path).lower() in KNOWN_HC_TEST_ROOTS
+                   or re.search(r"hc[-_]?test|test[-_]?core", path.lower())}
+    result["hc_test_roots"] = [tmp_by_path.get(path, {"path": path, "status": "not present in /tmp snapshot",
+        "bytes": None, "age_hours": None}) for path in sorted(identified_roots | named_roots)]
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        render(result)
+
+
+def render_action(action, indent="  "):
+    if not action:
+        return
+    print(f"{indent}{action['kind']} · target={action['target']}")
+    if action.get("recommendation"):
+        print(f"{indent}Recommendation: {action['recommendation']}")
+    print(f"{indent}What freed: {action['what_freed']}")
+    for step in action.get("inspect_steps", []):
+        print(f"{indent}How: {step}")
+    for risk in action.get("risks", []):
+        print(f"{indent}Risk: {risk}")
+    print(f"{indent}Undo: {action['undo']}")
+
+
+def render(data):
+    print(f"Read-only cleanup snapshot · {data['local_host']} · {data['generated_at']}")
+    print("Pi rows (Pi RSS/PSS, additional descendant PSS, session size/entries/age/write, native status)")
+    for row in data["pis"]:
+        p, s = row["process"], row["session"]
+        mib = lambda value: "?" if value is None else f"{value / 1024:.1f} MiB"
+        file_mib = lambda value: "?" if value is None else f"{value / (1024 * 1024):.1f} MiB"
+        age = "?" if s.get("header_age_days") is None else f"{s['header_age_days']:.1f}d"
+        print(f"{row['label']} / {row['role']} ({row['project'] or 'unknown'}) · {row['owner'] or 'owner unknown'}")
+        print(f"  Pi RSS {mib(p.get('rss_kib'))}, PSS {mib(p.get('pss_kib'))}, additional descendants "
+              f"{mib(p.get('additional_descendant_pss_kib'))} / {p.get('descendant_count') if p.get('descendant_count') is not None else '?'}")
+        print(f"  Session {file_mib(s.get('bytes'))}, {s.get('entries') if s.get('entries') is not None else '?'} entries, "
+              f"header age {age}, file write {s.get('mtime') or '?'}, native {row.get('status') or '?'} at {stamp(row.get('status_ms')) or '?'}")
+        print(f"  HC root {row.get('root_name') or '?'} pid={row.get('root_pid') or '?'}; children={len(row.get('native_children', []))}; "
+              f"starter-owned manus={len(row.get('starter_owned_manus', []))}; rollover-eligible={row.get('rollover_readiness', {}).get('eligible', False)}")
+        if row.get("flags"):
+            print("  FLAGS " + ", ".join(row["flags"]))
+            render_action(row.get("cleanup"))
+        if p.get("error"):
+            print("  Process: " + p["error"])
+        if s.get("error"):
+            print("  Session: " + s["error"])
+    print("Remote coverage")
+    for machine in data["coverage"]["remote_machines"]:
+        print(f"  {machine['machine']}: {machine['state']} · {machine['note']}")
+    for row in data.get("remote_pis", []):
+        print(f"  {row['machine']}/{row['label']} / {row['role']} ({row['project'] or 'unknown'}) · NOT SAMPLED HERE")
+    print(f"Browse-MCP processes: {data['browse_mcp']['process_count']} · total PSS {mib(data['browse_mcp']['total_pss_kib'])}")
+    for proc in data["browse_mcp"]["processes"]:
+        age = "?" if proc.get("age_hours") is None else f"{proc['age_hours']:.1f}h"
+        print(f"  PID {proc['pid']} · {proc['server_role']} · owner {proc['owner'] or 'unknown'} · {age} · PSS {mib(proc['pss_kib'])}")
+        print("  FLAGS " + ", ".join(proc["flags"]))
+        render_action(proc["cleanup"])
+    print(f"HC-test launchers: {len(data['hc_test_processes'])} · HC serve processes: {len(data['hc_core_processes'])}")
+    for proc in data["hc_test_processes"]:
+        print(f"HC-test: PID {proc['pid']} · root {proc.get('root') or 'unknown'} · owner {proc.get('owner') or 'unknown'} · PSS {mib(proc.get('pss_kib'))}")
+        print("  FLAGS " + ", ".join(proc["flags"]))
+        render_action(proc["cleanup"])
+    for proc in data["hc_core_processes"]:
+        print(f"HC serve: PIDs {', '.join(map(str, proc['pids']))} · test root {proc.get('root') or 'not identified'} · "
+              f"isolation verified={proc.get('isolation_verified')} · age {proc.get('age_hours')}h · PSS {mib(proc.get('pss_kib'))}")
+        print("  FLAGS " + ", ".join(proc["flags"]))
+        render_action(proc["cleanup"])
+    if data["tmp"].get("skipped"):
+        print("/tmp: " + data["tmp"]["skipped"])
+    elif data["tmp"].get("stale_review_count"):
+        count = data["tmp"]["stale_review_count"]
+        print(f"/tmp: {count} stale roots are review-only; every root has target-specific inspect steps below. No deletion is proposed.")
+    for root in data["tmp"].get("roots", []):
+        if root["flags"]:
+            action = root["cleanup"]
+            steps = "; ".join(action.get("inspect_steps", []))
+            print(f"/tmp review: {root['path']} · apparent bytes {root['bytes']} · {root['age_hours']:.1f}h · "
+                  f"How: {steps} · What freed: {action['what_freed']} · Risk: {action['risks'][0]} · Undo: {action['undo']}")
+    for error in data["tmp"].get("errors", []):
+        print(f"/tmp inaccessible; retain: {error['path']} · {error['error']}")
+    print("Recommendations only; no action executed. Retained-shell recipe requires owner confirmation and Algorant's specific live-change approval.")
+    print("Cost: " + json.dumps(data["cost"], separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

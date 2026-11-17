@@ -1,0 +1,9 @@
+# Worktrunk project hooks (task-133). A merge into main is what the Herdr app on every machine loads
+# its mods from, so this fast-forwards ~/Projects/herdra on each machine hc shows connected right
+# after the merge; `herdra-online <host>` does the same for one that reconnects after being away.
+#
+# Worktrunk requires this command to be approved once per machine (`wt config approvals add --yes` in
+# the checkout) and again if the command below changes; while it is unapproved, a non-interactive
+# `wt merge` stops rather than merging.
+[post-merge]
+mods = "bin/herdra-mods-sync"

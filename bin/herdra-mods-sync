@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Keep every machine's herdra checkout current, so a mod merged on main is live in the Herdr app
+# there without anyone pulling by hand (task-133; option C picked by Algorant 2026-11-11: one pull at
+# the merge and one at reconnect).
+#
+#   herdra-mods-sync [host...]  every machine in `hc machine ls` that is connected (default), or the
+#                               named ones. A machine with no ~/Projects/herdra is skipped. One line
+#                               per machine; a failure is printed and the rest carry on; exit 1 if any
+#                               failed.
+#
+# The commits come from this machine, not from origin: it pushes its main to refs/remotes/desktop/main
+# on the machine, which merges that into its own checkout. A merge is real before it is pushed, and
+# the app loads the checkout, not GitHub. Run by .config/wt.toml's post-merge hook on the machine
+# whose main moved (worktrunk needs that one command approved there once), and by
+# `herdra-online <host>` when a machine reconnects after being away.
+set -uo pipefail   # no -e: one machine's failure must not stop the others
+
+checkout=Projects/herdra        # under $HOME on every machine; the mods symlink into it
+branch=refs/heads/main
+seen=refs/remotes/desktop/main  # where this machine's main lands on the other one
+
+machines=$(hc machine ls --json) || exit 1
+if (($#)); then
+  hosts=("$@")
+else
+  mapfile -t hosts < <(jq -r '.machines[] | select(.state == "connected") | .name' <<<"$machines")
+fi
+((${#hosts[@]})) || exit 0
+
+errors=0
+for h in "${hosts[@]}"; do
+  # The ssh name hc reaches it by, so this machine needs no other way of naming it.
+  target=$(jq -r --arg n "$h" 'first(.machines[] | select(.name == $n) | .target) // empty' <<<"$machines")
+  if [[ -z $target ]]; then
+    echo "herdra-mods-sync: no machine $h in hc machine ls" >&2
+    errors=1; continue
+  fi
+
+  before=$(hc exec --on "$h" -- sh -c "test -d ~/$checkout/.git || exit 3
+    git -C ~/$checkout rev-parse --short $branch" 2>&1)
+  rc=$?
+  if ((rc == 3)); then continue; fi   # no herdra checkout there: nothing to keep current
+  if ((rc != 0)); then
+    echo "herdra-mods-sync: $h: cannot read its checkout: ${before//$'\n'/ }" >&2
+    errors=1; continue
+  fi
+  now=$(git rev-parse --short "$branch")
+  if [[ $before == "$now" ]]; then
+    echo "$h  $now already"
+    continue
+  fi
+
+  # --force: that ref is written by this script alone, and the machine's own branch is only ever
+  # merged below, --ff-only; so a push that would be refused as not a fast-forward of that ref (an
+  # older sync, or one from another machine) still lands.
+  if ! out=$(git push --quiet --force "ssh://$target/~/$checkout" "$branch:$seen" 2>&1); then
+    echo "herdra-mods-sync: $h: push to its checkout failed: ${out//$'\n'/ }" >&2
+    errors=1; continue
+  fi
+  if ! after=$(hc exec --on "$h" -- sh -c "git -C ~/$checkout merge --ff-only --quiet $seen &&
+    git -C ~/$checkout rev-parse --short $branch" 2>&1); then
+    echo "herdra-mods-sync: $h: merge in its checkout failed: ${after//$'\n'/ }" >&2
+    errors=1; continue
+  fi
+  echo "$h  $before -> $after"
+done
+exit "$errors"

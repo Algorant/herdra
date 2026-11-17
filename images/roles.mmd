@@ -1,0 +1,23 @@
+flowchart TD
+  Y([me]) -->|request| H[Herdra<br/>routes and tracks]
+  H -->|outcome + Task| C[Ceph<br/>project lead]
+  C -->|track| M1[manus<br/>own tab + worktree]
+  C -->|track| M2[manus<br/>own tab + worktree]
+  M1 --> W1[Worker<br/>builds one Task]
+  M1 --> S1[scout<br/>reads, reports]
+  M2 --> W2[Worker<br/>builds one Task]
+  W1 -.->|ready| M1
+  S1 -.->|report| M1
+  W2 -.->|ready| M2
+  M1 -.->|result| C
+  M2 -.->|result| C
+  C -.->|merged| H
+  H -.->|what needs me| Y
+  classDef herdra fill:#2f3a2c,stroke:#8ec07c,color:#ebdbb2
+  classDef ceph fill:#2b3530,stroke:#689d6a,color:#ebdbb2
+  classDef manus fill:#2a3335,stroke:#83a598,color:#ebdbb2
+  classDef dendra fill:#383228,stroke:#e6bf86,color:#ebdbb2
+  class H herdra
+  class C ceph
+  class M1,M2 manus
+  class W1,W2,S1 dendra
